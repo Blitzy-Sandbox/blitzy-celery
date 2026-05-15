@@ -1,0 +1,11 @@
+# Celery's existing docs/ is Sphinx/reStructuredText (.rst) with conf.py.
+# TechDocs/MkDocs only renders Markdown, not .rst. Until docs are ported
+# (or a Sphinx->MD bridge is set up), this site only ships a stub index.md
+# that links out to the upstream Sphinx-built documentation.
+site_name: Celery
+site_description: Distributed Task Queue (Blitzy fork)
+docs_dir: docs
+plugins:
+  - techdocs-core
+nav:
+  - Home: index.md
