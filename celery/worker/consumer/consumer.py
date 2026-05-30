@@ -29,6 +29,7 @@ from celery.utils.functional import noop
 from celery.utils.log import get_logger
 from celery.utils.nodenames import gethostname
 from celery.utils.objects import Bunch
+from celery.utils.rate_limit import get_rate_limiter_for_task
 from celery.utils.text import truncate
 from celery.utils.time import humanize_seconds, rate
 from celery.worker import loops
@@ -294,8 +295,11 @@ class Consumer:
                     logger.exception('Pending callback raised: %r', exc)
 
     def bucket_for_task(self, type):
-        limit = rate(getattr(type, 'rate_limit', None))
-        return TokenBucket(limit, capacity=1) if limit else None
+        # NOTE: global rate limiter — delegate bucket construction to the
+        # factory in celery/utils/rate_limit/factory.py. This single site is
+        # the entire integration point; the factory returns None, a per-process
+        # TokenBucket, or a Redis-backed GlobalRateLimiter (TokenBucket subclass).
+        return get_rate_limiter_for_task(self.app, type)
 
     def reset_rate_limits(self):
         self.task_buckets.update(
