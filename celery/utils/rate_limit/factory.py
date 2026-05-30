@@ -2,6 +2,7 @@
 from kombu.utils.limits import TokenBucket
 
 from celery.utils.log import get_logger
+from celery.utils.serialization import strtobool
 from celery.utils.time import rate
 
 from .global_limiter import GlobalRateLimiter
@@ -43,7 +44,23 @@ def get_rate_limiter_for_task(app, task):
         # Preserves legacy semantics: bucket_for_task returns None when the task
         # carries no (or a zero) rate_limit.  See celery/worker/consumer/consumer.py.
         return None
-    if not app.conf.worker_global_rate_limit_enabled:
+    # The opt-out flag is a bool by default, but when it is supplied through an
+    # environment-variable-backed config source -- the standard
+    # ``config_from_object(..., namespace='CELERY')`` pattern, e.g. the
+    # ``CELERY_WORKER_GLOBAL_RATE_LIMIT_ENABLED`` environment variable -- it
+    # arrives as a string such as 'False'/'0'/'no', all of which are truthy
+    # under a plain ``bool()`` check and would silently defeat the opt-out
+    # (QA F4). Coerce bool-like strings with ``strtobool`` -- the same coercion
+    # the ``Option(type='bool')`` system uses (see celery/app/defaults.py).
+    # Real bool/None values pass through untouched; an unrecognised string keeps
+    # its legacy truthiness so this never raises into the task-dispatch path.
+    enabled = app.conf.worker_global_rate_limit_enabled
+    if isinstance(enabled, str):
+        try:
+            enabled = strtobool(enabled)
+        except TypeError:
+            pass
+    if not enabled:
         # Opt-out flag set -> exact legacy per-process behaviour.
         return TokenBucket(limit, capacity=1)
     redis_client = _discover_redis_client(app)

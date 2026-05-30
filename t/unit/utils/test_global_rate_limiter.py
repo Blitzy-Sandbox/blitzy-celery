@@ -180,6 +180,51 @@ class test_get_rate_limiter_for_task:
         assert isinstance(result, TokenBucket)
         assert not isinstance(result, GlobalRateLimiter)
 
+    @pytest.mark.parametrize('flag', ['False', 'false', 'FALSE', '0', 'no', 'off'])
+    def test_returns_tokenbucket_when_disabled_via_env_string(self, flag):
+        # QA F4 regression: when the opt-out flag is supplied through an
+        # environment-variable-backed config source (``config_from_object`` with
+        # ``namespace='CELERY'``, e.g. ``CELERY_WORKER_GLOBAL_RATE_LIMIT_ENABLED=False``)
+        # it arrives as a *string* such as 'False'/'0'/'no' -- all truthy under a
+        # plain ``bool()`` check.  The factory must coerce these bool-like strings
+        # and honor the opt-out, returning the legacy per-process TokenBucket EVEN
+        # THOUGH a Redis backend is available and discoverable (proving the
+        # TokenBucket comes from the coerced opt-out, not from absent Redis).
+        fake = _fake_redis_backend_module()
+        backend = fake.RedisBackend()
+        backend.client = MagicMock(name='backend_client')
+        app = _make_app(enabled=flag, backend=backend)
+        with patch.dict(sys.modules, {'celery.backends.redis': fake}):
+            result = get_rate_limiter_for_task(app, _make_task(rate_limit='5/s'))
+        assert isinstance(result, TokenBucket)
+        assert not isinstance(result, GlobalRateLimiter)
+
+    @pytest.mark.parametrize('flag', ['True', 'true', 'TRUE', '1', 'yes', 'on'])
+    def test_returns_global_limiter_when_enabled_via_env_string(self, flag):
+        # QA F4 regression: bool-like *true* strings (the env-loaded form of the
+        # default) must keep the global limiter active when Redis is reachable --
+        # i.e. coercion must not over-correct and disable an enabled flag.
+        fake = _fake_redis_backend_module()
+        backend = fake.RedisBackend()
+        backend.client = MagicMock(name='backend_client')
+        app = _make_app(enabled=flag, backend=backend)
+        with patch.dict(sys.modules, {'celery.backends.redis': fake}):
+            result = get_rate_limiter_for_task(app, _make_task(rate_limit='5/s'))
+        assert isinstance(result, GlobalRateLimiter)
+        assert result._redis is backend.client
+
+    def test_unrecognized_env_string_does_not_raise_and_keeps_enabled(self):
+        # An unrecognised flag string must NOT raise out of the factory (and thus
+        # out of bucket_for_task); it keeps its legacy truthiness, so with Redis
+        # reachable the global limiter stays active and dispatch is never broken.
+        fake = _fake_redis_backend_module()
+        backend = fake.RedisBackend()
+        backend.client = MagicMock(name='backend_client')
+        app = _make_app(enabled='not-a-bool', backend=backend)
+        with patch.dict(sys.modules, {'celery.backends.redis': fake}):
+            result = get_rate_limiter_for_task(app, _make_task(rate_limit='5/s'))
+        assert isinstance(result, GlobalRateLimiter)
+
     def test_returns_tokenbucket_when_no_redis_anywhere(self):
         app = _make_app(enabled=True, broker_url='pyamqp://', backend=object())
         fake = _fake_redis_backend_module()

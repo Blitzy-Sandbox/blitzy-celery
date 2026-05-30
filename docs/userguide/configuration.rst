@@ -3614,8 +3614,15 @@ to per-process behavior.
 
 Configure it like any other Celery setting -- for example in your
 :file:`celeryconfig.py` module, via :meth:`@config_from_object`, or directly
-with ``app.conf.worker_global_rate_limit_enabled = False``. There is no
-dedicated environment variable for this setting.
+with ``app.conf.worker_global_rate_limit_enabled = False``.
+
+When configuration is loaded under the ``CELERY`` namespace (for example
+``app.config_from_object(settings, namespace='CELERY')`` or Django's
+``CELERY_``-prefixed settings), the setting can also be controlled from the
+environment through the ``CELERY_WORKER_GLOBAL_RATE_LIMIT_ENABLED`` environment
+variable. Bool-like string values are honored, so
+``CELERY_WORKER_GLOBAL_RATE_LIMIT_ENABLED=False`` (or ``0``, ``no``, ``off``)
+disables the global limiter exactly like the boolean ``False``.
 
 See also :setting:`worker_disable_rate_limits` and
 :setting:`task_default_rate_limit`.
