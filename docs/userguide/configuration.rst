@@ -3596,6 +3596,25 @@ Default: Disabled (rate limits enabled).
 
 Disable all rate limits, even if tasks has explicit rate limits set.
 
+.. setting:: worker_global_rate_limit_enabled
+
+``worker_global_rate_limit_enabled``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: Enabled.
+
+When a Redis broker or result backend is configured, per-task rate limits
+(``@app.task(rate_limit=...)``) are enforced cluster-wide using an atomic
+Redis token bucket, instead of per worker process. Auto-detected from the
+configured Redis result backend or ``redis://`` / ``rediss://`` broker.
+
+Set to ``False`` to opt out and fall back to the legacy per-process rate
+limiter. If Redis is unavailable at runtime, the limiter degrades gracefully
+to per-process behavior.
+
+See also :setting:`worker_disable_rate_limits` and
+:setting:`task_default_rate_limit`.
+
 .. setting:: worker_state_db
 
 ``worker_state_db``
