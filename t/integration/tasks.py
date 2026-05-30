@@ -564,3 +564,8 @@ def task_with_declared_time_limits(self):
         'time_limit': self.request.time_limit,
         'soft_time_limit': self.request.soft_time_limit,
     }
+
+
+@shared_task(rate_limit='2/s')
+def rate_limited_task():
+    return 'ok'

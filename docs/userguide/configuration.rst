@@ -3596,6 +3596,37 @@ Default: Disabled (rate limits enabled).
 
 Disable all rate limits, even if tasks has explicit rate limits set.
 
+.. setting:: worker_global_rate_limit_enabled
+
+``worker_global_rate_limit_enabled``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: Enabled.
+
+When a Redis broker or result backend is configured, per-task rate limits
+(``@app.task(rate_limit=...)``) are enforced cluster-wide using an atomic
+Redis token bucket, instead of per worker process. Auto-detected from the
+configured Redis result backend or ``redis://`` / ``rediss://`` broker.
+
+Set to ``False`` to opt out and fall back to the legacy per-process rate
+limiter. If Redis is unavailable at runtime, the limiter degrades gracefully
+to per-process behavior.
+
+Configure it like any other Celery setting -- for example in your
+:file:`celeryconfig.py` module, via :meth:`@config_from_object`, or directly
+with ``app.conf.worker_global_rate_limit_enabled = False``.
+
+When configuration is loaded under the ``CELERY`` namespace (for example
+``app.config_from_object(settings, namespace='CELERY')`` or Django's
+``CELERY_``-prefixed settings), the setting can also be controlled from the
+environment through the ``CELERY_WORKER_GLOBAL_RATE_LIMIT_ENABLED`` environment
+variable. Bool-like string values are honored, so
+``CELERY_WORKER_GLOBAL_RATE_LIMIT_ENABLED=False`` (or ``0``, ``no``, ``off``)
+disables the global limiter exactly like the boolean ``False``.
+
+See also :setting:`worker_disable_rate_limits` and
+:setting:`task_default_rate_limit`.
+
 .. setting:: worker_state_db
 
 ``worker_state_db``

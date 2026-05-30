@@ -805,6 +805,29 @@ list of workers you can include the ``destination`` argument:
     This won't affect workers with the
     :setting:`worker_disable_rate_limits` setting enabled.
 
+Global (cluster-wide) rate limits
+---------------------------------
+
+When a Redis broker or result backend is configured, a task's
+``rate_limit`` is enforced across the entire worker cluster atomically
+using a Redis token bucket, rather than independently per worker process.
+This makes a declared rate the true aggregate throughput cap regardless of
+how many workers are running.
+
+You can opt out and restore the legacy per-process behavior by setting
+:setting:`worker_global_rate_limit_enabled` to ``False``. The feature is
+also failure-isolated: if Redis is unreachable, the limiter degrades
+gracefully to per-process limiting and never blocks task dispatch.
+
+.. code-block:: python
+
+    @app.task(rate_limit='100/m')
+    def my_task():
+        ...
+
+With a Redis broker or backend configured, the example above is limited to
+100 invocations per minute across the whole cluster, not per worker.
+
 .. _worker-max-tasks-per-child:
 
 Max tasks per child setting
