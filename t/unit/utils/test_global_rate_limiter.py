@@ -223,3 +223,49 @@ class test_get_rate_limiter_for_task:
                 result = get_rate_limiter_for_task(app, _make_task(rate_limit='5/s'))
         assert isinstance(result, TokenBucket)
         assert not isinstance(result, GlobalRateLimiter)
+
+    def test_returns_tokenbucket_when_redis_backend_import_fails(self):
+        # Exercises the _discover_redis_client `except` path for the documented
+        # redis-extra-absent case (AAP I5 / R5 / §0.7.6 failure isolation): when
+        # the optional `redis` extra is not installed, the deferred
+        # `from celery.backends.redis import RedisBackend` raises
+        # ModuleNotFoundError.  Mapping the module to None in sys.modules makes
+        # that import statement raise, faithfully simulating the missing extra.
+        # Discovery must swallow it, log a URL-free WARNING, and return None so
+        # the factory degrades to the legacy per-process TokenBucket instead of
+        # propagating the exception out of bucket_for_task.
+        app = _make_app(enabled=True, broker_url='redis://localhost/0', backend=object())
+        with patch.dict(sys.modules, {'celery.backends.redis': None}):
+            with patch('celery.utils.rate_limit.factory.logger') as log:
+                result = get_rate_limiter_for_task(app, _make_task(rate_limit='5/s'))
+        assert isinstance(result, TokenBucket)
+        assert not isinstance(result, GlobalRateLimiter)
+        assert log.warning.called
+        # §0.7.6: the credential-bearing broker/Redis URL must never be logged.
+        args = log.warning.call_args.args
+        message = args[0] % tuple(args[1:])
+        assert 'redis://' not in message
+        assert 'rediss://' not in message
+
+    def test_returns_tokenbucket_when_broker_connection_raises(self):
+        # Exercises the _discover_redis_client `except` path for the
+        # broker-connection-error case (AAP R5 / §0.7.6 failure isolation): a
+        # redis:// broker is configured (so discovery enters the broker branch),
+        # but obtaining the broker connection raises.  Discovery must swallow the
+        # error, log a URL-free WARNING, and return None so the factory degrades
+        # to the legacy per-process TokenBucket instead of propagating the
+        # exception out of bucket_for_task.
+        fake = _fake_redis_backend_module()
+        app = _make_app(enabled=True, broker_url='redis://localhost/0', backend=object())
+        app.connection_for_read.side_effect = ConnectionError('broker down')
+        with patch.dict(sys.modules, {'celery.backends.redis': fake}):
+            with patch('celery.utils.rate_limit.factory.logger') as log:
+                result = get_rate_limiter_for_task(app, _make_task(rate_limit='5/s'))
+        assert isinstance(result, TokenBucket)
+        assert not isinstance(result, GlobalRateLimiter)
+        assert log.warning.called
+        # §0.7.6: the credential-bearing broker/Redis URL must never be logged.
+        args = log.warning.call_args.args
+        message = args[0] % tuple(args[1:])
+        assert 'redis://' not in message
+        assert 'rediss://' not in message
