@@ -198,6 +198,7 @@ class test_global_rate_limit:
         # Deferred/local import mirrors the factory's own lazy import and avoids
         # a load-time cycle with the backend layer.
         from celery.backends.redis import RedisBackend
+
         # Mirror the factory's selection contract exactly (see
         # _discover_redis_client in celery/utils/rate_limit/factory.py): the
         # GlobalRateLimiter is chosen when the result backend is a RedisBackend

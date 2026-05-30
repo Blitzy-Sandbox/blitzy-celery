@@ -18,7 +18,7 @@ from kombu.common import ignore_errors
 from kombu.exceptions import ContentDisallowed, DecodeError
 from kombu.utils.compat import _detect_environment
 from kombu.utils.encoding import safe_repr
-from kombu.utils.limits import TokenBucket
+from kombu.utils.limits import TokenBucket  # noqa: F401
 from vine import ppartial, promise
 
 from celery import bootsteps, signals
@@ -31,7 +31,7 @@ from celery.utils.nodenames import gethostname
 from celery.utils.objects import Bunch
 from celery.utils.rate_limit import get_rate_limiter_for_task
 from celery.utils.text import truncate
-from celery.utils.time import humanize_seconds, rate
+from celery.utils.time import humanize_seconds, rate  # noqa: F401
 from celery.worker import loops
 from celery.worker.state import (active_requests, maybe_shutdown, requests, reserved_requests, successful_requests,
                                  task_reserved)
