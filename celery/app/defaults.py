@@ -337,6 +337,8 @@ NAMESPACES = Namespace(
         disable_rate_limits=Option(
             False, type='bool', old={'celery_disable_rate_limits'},
         ),
+        # NOTE: global rate limiter — opt-out flag; see celery/utils/rate_limit/factory.py
+        global_rate_limit_enabled=Option(True, type='bool'),
         deduplicate_successful_tasks=Option(
             False, type='bool'
         ),
