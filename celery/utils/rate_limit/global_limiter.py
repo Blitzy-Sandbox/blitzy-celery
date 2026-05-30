@@ -15,9 +15,14 @@ logger = get_logger(__name__)
 #
 # Contract:
 #   KEYS = [bucket_key]                       -- "celery:rate:<task_name>"
-#   ARGV = [rate, capacity, tokens]           -- rate=tokens/sec (float),
+#   ARGV = [rate, capacity, tokens, consume]  -- rate=tokens/sec (float),
 #                                                capacity=bucket size,
-#                                                tokens=request size (usually 1)
+#                                                tokens=request size (usually 1),
+#                                                consume=1 to spend tokens on a
+#                                                successful check (can_consume),
+#                                                or 0 for a non-consuming peek
+#                                                that only refills timing state
+#                                                (expected_time).
 #   returns {allowed, wait_seconds}           -- allowed is 1 or 0;
 #                                                wait_seconds is a STRING.
 #
@@ -36,6 +41,9 @@ local key = KEYS[1]
 local rate = tonumber(ARGV[1])
 local capacity = tonumber(ARGV[2])
 local request = tonumber(ARGV[3])
+-- consume=1 -> spend a token on success (can_consume); consume=0 -> non-consuming
+-- peek (expected_time): refill/write timing state but never decrement.
+local consume = tonumber(ARGV[4])
 
 -- Server-side clock ONLY: eliminates worker clock skew (every `now` comes from here).
 local t = redis.call('TIME')
@@ -63,8 +71,16 @@ end
 local allowed = 0
 local wait = 0
 if new_tokens >= request then
-    new_tokens = new_tokens - request
     allowed = 1
+    -- Only spend a token when the caller intends to CONSUME (can_consume).
+    -- expected_time passes consume=0 so it acts as a non-consuming peek: the
+    -- consumer's scheduling loop has already requeued the request before
+    -- calling expected_time, so decrementing here would lose capacity and
+    -- under-dispatch. Mirrors kombu TokenBucket.expected_time, which refills
+    -- via _get_tokens but never decrements.
+    if consume == 1 then
+        new_tokens = new_tokens - request
+    end
 else
     wait = (request - new_tokens) / rate
 end
@@ -104,9 +120,11 @@ class GlobalRateLimiter(TokenBucket):
 
     def can_consume(self, tokens=1):
         try:
+            # consume=1: spend the requested tokens on success (consuming check),
+            # matching kombu TokenBucket.can_consume which decrements on success.
             result = self._script(
                 keys=[self._key],
-                args=[self.fill_rate, self.capacity, tokens],
+                args=[self.fill_rate, self.capacity, tokens, 1],
             )
             return bool(result[0])
         except Exception as exc:
@@ -119,10 +137,15 @@ class GlobalRateLimiter(TokenBucket):
             return super().can_consume(tokens)
 
     def expected_time(self, tokens=1):
+        # NON-consuming peek (consume=0): the consumer calls expected_time only
+        # after can_consume returned False and the request was requeued, so this
+        # must NOT spend a token (doing so loses capacity / under-dispatches).
+        # Mirrors kombu TokenBucket.expected_time, which refills but never
+        # decrements; it still refreshes the refill timestamp/TTL via the script.
         try:
             result = self._script(
                 keys=[self._key],
-                args=[self.fill_rate, self.capacity, tokens],
+                args=[self.fill_rate, self.capacity, tokens, 0],
             )
             return float(result[1])
         except Exception as exc:

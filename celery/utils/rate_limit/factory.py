@@ -50,7 +50,19 @@ def get_rate_limiter_for_task(app, task):
     if redis_client is None:
         # No Redis broker/backend reachable -> legacy per-process behaviour.
         return TokenBucket(limit, capacity=1)
-    return GlobalRateLimiter(limit, redis_client, task.name, capacity=max(1, int(limit)))
+    # R5 / §0.7.6 failure isolation: constructing GlobalRateLimiter registers the
+    # Lua script on the Redis client, which can raise on an incompatible/bad
+    # client. Catch ANY construction failure here so bucket_for_task never
+    # propagates an exception -- degrade to the legacy per-process TokenBucket.
+    try:
+        return GlobalRateLimiter(limit, redis_client, task.name, capacity=max(1, int(limit)))
+    except Exception as exc:
+        # SECURITY (§0.7.6): log ONLY the exception class -- never the client,
+        # backend, or broker/Redis URL, which may carry credentials.
+        logger.warning(
+            'Global rate limiter: construction failed (%s); '
+            'using per-process rate limits.', exc.__class__.__name__)
+        return TokenBucket(limit, capacity=1)
 
 
 def _discover_redis_client(app):
