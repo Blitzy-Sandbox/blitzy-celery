@@ -42,14 +42,15 @@ TIMEOUT = 10
 # registered here.
 #
 # MARKER DISCIPLINE (verified gotcha -- see AAP Phase B): only ``redis``,
-# ``flaky`` and ``timeout`` are registered markers in this repo. ``@pytest.mark.celery``
-# is intentionally NOT used: ``celery.contrib.pytest`` is not registered as a
-# pytest plugin (no ``pytest11`` entry point in ``setup.py``, no
-# ``pytest_plugins`` declaration), so the ``celery`` marker is unknown. Under
-# the project's ``--strict-markers`` (set in ``[tool.pytest.ini_options].addopts``)
-# ``@pytest.mark.celery`` would raise a collection error ("'celery' not found in
-# markers configuration option"). Neighbouring integration suites
-# (test_tasks.py, test_canvas.py, test_inspect.py) likewise rely only on
+# ``flaky`` and ``timeout`` are registered markers in this repo. The
+# unregistered Celery marker is intentionally NOT used:
+# ``celery.contrib.pytest`` is not registered as a pytest plugin (no
+# ``pytest11`` entry point in ``setup.py``, no ``pytest_plugins``
+# declaration), so that marker is unknown. Under the project's
+# ``--strict-markers`` (set in ``[tool.pytest.ini_options].addopts``) applying
+# it would raise a collection error ("'celery' not found in markers
+# configuration option"). Neighbouring integration suites (test_tasks.py,
+# test_canvas.py, test_inspect.py) likewise rely only on
 # ``flaky``/``timeout``/``xfail``.
 @pytest.mark.redis
 class test_global_rate_limit:
@@ -186,8 +187,10 @@ class test_global_rate_limit:
 
         The integration harness defaults ``TEST_BACKEND`` to ``redis://`` (a
         ``RedisBackend``), so the factory must pick the cluster-wide limiter.
-        The strict assertion is guarded so the test still passes on a non-Redis
-        CI variant by asserting the legacy ``TokenBucket`` instead.
+        The guard mirrors the factory's selection contract -- a Redis result
+        backend *or* a ``redis://``/``rediss://`` broker -- so the assertion is
+        correct under a Redis-broker-only variant too, and still passes on a
+        fully non-Redis CI variant by asserting the legacy ``TokenBucket``.
         """
         app = manager.app
         assert app.conf.worker_global_rate_limit_enabled is True
@@ -195,8 +198,13 @@ class test_global_rate_limit:
         # Deferred/local import mirrors the factory's own lazy import and avoids
         # a load-time cycle with the backend layer.
         from celery.backends.redis import RedisBackend
+        # Mirror the factory's selection contract exactly (see
+        # _discover_redis_client in celery/utils/rate_limit/factory.py): the
+        # GlobalRateLimiter is chosen when the result backend is a RedisBackend
+        # OR the broker URL is ``redis://``/``rediss://``. The broker scheme MUST
+        # be included so a Redis-broker-only environment is not misclassified.
         redis_env = isinstance(app.backend, RedisBackend) or str(
-            app.conf.result_backend or '').startswith(('redis://', 'rediss://'))
+            app.conf.broker_url or '').startswith(('redis://', 'rediss://'))
         if redis_env:
             assert isinstance(bucket, GlobalRateLimiter)
         else:
