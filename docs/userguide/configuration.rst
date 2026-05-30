@@ -3612,6 +3612,11 @@ Set to ``False`` to opt out and fall back to the legacy per-process rate
 limiter. If Redis is unavailable at runtime, the limiter degrades gracefully
 to per-process behavior.
 
+Configure it like any other Celery setting -- for example in your
+:file:`celeryconfig.py` module, via :meth:`@config_from_object`, or directly
+with ``app.conf.worker_global_rate_limit_enabled = False``. There is no
+dedicated environment variable for this setting.
+
 See also :setting:`worker_disable_rate_limits` and
 :setting:`task_default_rate_limit`.
 
