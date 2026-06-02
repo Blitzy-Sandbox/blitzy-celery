@@ -25,6 +25,7 @@ from celery import bootsteps, signals
 from celery.app.trace import build_tracer
 from celery.exceptions import (CPendingDeprecationWarning, InvalidTaskError, NotRegistered, WorkerShutdown,
                                WorkerTerminate)
+from celery.rate_limiting.redis_rate_limiter import RedisTokenBucket
 from celery.utils.functional import noop
 from celery.utils.log import get_logger
 from celery.utils.nodenames import gethostname
@@ -295,6 +296,17 @@ class Consumer:
 
     def bucket_for_task(self, type):
         limit = rate(getattr(type, 'rate_limit', None))
+        # Global (Redis-backed) rate limiting is opt-in: when
+        # task_global_rate_limit_backend is configured, enforce the existing
+        # rate_limit across the whole worker fleet via RedisTokenBucket;
+        # otherwise fall back to the per-worker TokenBucket (unchanged default).
+        if limit and self.app.conf.task_global_rate_limit_backend:
+            return RedisTokenBucket(
+                limit, capacity=1,
+                backend_url=self.app.conf.task_global_rate_limit_backend,
+                task_name=type.name,
+                fail_open=self.app.conf.task_global_rate_limit_fail_open,
+            )
         return TokenBucket(limit, capacity=1) if limit else None
 
     def reset_rate_limits(self):

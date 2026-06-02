@@ -7,10 +7,12 @@ from unittest.mock import MagicMock, Mock, call, patch
 import pytest
 from amqp import ChannelError
 from billiard.exceptions import RestartFreqExceeded
+from kombu.utils.limits import TokenBucket
 
 from celery import bootsteps
 from celery.contrib.testing.mocks import ContextMock
 from celery.exceptions import WorkerShutdown, WorkerTerminate
+from celery.rate_limiting.redis_rate_limiter import RedisTokenBucket
 from celery.utils.collections import LimitedSet
 from celery.utils.quorum_queues import detect_quorum_queues
 from celery.worker.consumer.agent import Agent
@@ -58,6 +60,49 @@ class test_Consumer(ConsumerTestCase):
     def test_taskbuckets_defaultdict(self):
         c = self.get_consumer()
         assert c.task_buckets['fooxasdwx.wewe'] is None
+
+    def test_bucket_for_task_local_when_global_backend_unset(self):
+        # Global rate-limit backend not configured -> unchanged per-worker
+        # kombu TokenBucket (today's default behavior).
+        @self.app.task(shared=False, rate_limit='10/s')
+        def task_local():
+            pass
+
+        c = self.get_consumer()
+        bucket = c.bucket_for_task(task_local)
+        assert isinstance(bucket, TokenBucket)
+        # RedisTokenBucket SUBCLASSES TokenBucket, so the negative assertion
+        # is REQUIRED to prove we got the local (not the global) bucket.
+        assert not isinstance(bucket, RedisTokenBucket)
+
+    def test_bucket_for_task_global_when_backend_set(self):
+        # With the global backend configured, the factory returns the
+        # Redis-backed bucket for a task with a truthy rate_limit.
+        self.app.conf.task_global_rate_limit_backend = 'redis://localhost:6379/0'
+
+        @self.app.task(shared=False, rate_limit='10/s')
+        def task_global():
+            pass
+
+        c = self.get_consumer()
+        bucket = c.bucket_for_task(task_global)
+        assert isinstance(bucket, RedisTokenBucket)
+
+    def test_bucket_for_task_noop_when_rate_limit_falsy(self):
+        # Even with the global backend configured, a falsy rate_limit must be
+        # a complete no-op: factory returns None and NO Redis bucket is built.
+        self.app.conf.task_global_rate_limit_backend = 'redis://localhost:6379/0'
+
+        @self.app.task(shared=False)  # rate_limit defaults to None
+        def task_none():
+            pass
+
+        c = self.get_consumer()
+        # Patch a redis-py-INDEPENDENT seam to prove zero Redis access: patch
+        # the factory's module-level reference to the class (no `import redis`).
+        with patch('celery.worker.consumer.consumer.RedisTokenBucket') as mock_rtb:
+            assert c.bucket_for_task(task_none) is None
+            mock_rtb.assert_not_called()
 
     def test_sets_heartbeat(self):
         c = self.get_consumer(amqheartbeat=10)
