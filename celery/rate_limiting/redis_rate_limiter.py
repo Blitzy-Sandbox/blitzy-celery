@@ -114,7 +114,7 @@ if delta < 0 then delta = 0 end
 tokens = math.min(capacity, tokens + (delta * fill_rate))
 local allowed = 0
 if tokens >= requested then tokens = tokens - requested; allowed = 1 end
-redis.call('HMSET', KEYS[1], 'tokens', tokens, 'ts', now)
+redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
 redis.call('EXPIRE', KEYS[1], ttl)
 return allowed
 """

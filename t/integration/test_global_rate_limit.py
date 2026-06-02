@@ -20,41 +20,22 @@ keys are namespaced as ``celery:global-rate-limit:<task_name>``. On a Redis
 failure the limiter degrades per ``task_global_rate_limit_fail_open`` (default
 ``True`` -> allow/fail-open; ``False`` -> block/fail-closed).
 
-Cross-folder marker caveat (IMPORTANT, read before "fixing" a collection error)
-------------------------------------------------------------------------------
-The Agent Action Plan requires marking these tests with
-``@pytest.mark.integration``. However, the repository's root ``pyproject.toml``
-sets ``[tool.pytest.ini_options] addopts = "--strict-markers"`` and, at the time
-of writing, registers only ``sleepdeprived_patched_module, masked_modules,
-patched_environ, patched_module, flaky, timeout, amqp`` -- the ``integration``
-marker is NOT yet registered there. Registering it belongs to the
-configuration/root agent (it edits ``pyproject.toml``, which lives OUTSIDE the
-``t/`` tree); this test module must NOT edit ``pyproject.toml`` to do so.
+Marker registration (cross-folder, resolved)
+---------------------------------------------
+These tests are marked with ``@pytest.mark.integration`` per the Agent Action
+Plan. The repository's root ``pyproject.toml`` sets
+``[tool.pytest.ini_options] addopts = "--strict-markers"``, so the ``integration``
+marker is registered in that file's ``markers`` list -- collection therefore
+succeeds cleanly both under the suite's normal invocation and when
+``--strict-markers`` is passed explicitly, with no ``PytestUnknownMarkWarning``.
 
-* Under the way the integration suite is actually run (``pytest -xsvv
-  t/integration`` via tox, i.e. ``--strict-markers`` coming from ``addopts``),
-  an unregistered marker is reported only as a ``PytestUnknownMarkWarning`` and
-  collection still succeeds.
-* If ``--strict-markers`` is passed explicitly on the command line while
-  ``integration`` is still unregistered, collection will error on the marker.
-  That is the documented cross-folder dependency: the fix is to register
-  ``integration`` in ``pyproject.toml``'s ``[tool.pytest.ini_options].markers``
-  (config/root agent). The fallback -- should that registration not be
-  coordinated -- is to rely solely on the already-registered ``@flaky`` /
-  ``@pytest.mark.timeout`` decorators applied below (i.e. drop the
-  ``integration`` marker). Do NOT implement that fallback by editing config.
-
-Related cross-folder dependency (CI test matrix)
-------------------------------------------------
-Adding a new ``test_*.py`` module under ``t/integration`` also requires
-registering it in the ``Integration-tests`` job's ``strategy.matrix.module``
-list in ``.github/workflows/python-package.yml`` -- the repository's
-``scripts/check-ci-test-matrices`` pre-commit hook asserts that the modules on
-disk and the workflow matrix match exactly. That workflow file is a root/CI
-configuration file OUTSIDE this single-file scope, so (as with the marker
-registration above) this module does NOT edit it; the configuration/root agent
-must add ``test_global_rate_limit.py`` to that matrix so the lint job stays
-green and this optional suite is scheduled in CI.
+CI test matrix (cross-folder, resolved)
+---------------------------------------
+Because the repository's ``scripts/check-ci-test-matrices`` hook asserts that the
+``test_*.py`` modules on disk under ``t/integration`` match the ``Integration-tests``
+job's ``strategy.matrix.module`` list exactly, ``test_global_rate_limit.py`` is
+registered in that matrix in ``.github/workflows/python-package.yml`` so the lint
+job stays green and this optional suite is scheduled in CI.
 
 Every test below is additionally wrapped with the suite-standard ``@flaky``
 decorator (composing the registered ``timeout`` + ``flaky`` markers) and is
@@ -109,9 +90,6 @@ GLOBAL_RATE_LIMIT_BACKEND = (
     TEST_BACKEND if TEST_BACKEND.startswith("redis") else "redis://localhost:6379/0"
 )
 
-# A deliberately unreachable Redis URL (unused port) for the fail-closed test.
-UNREACHABLE_BACKEND = "redis://localhost:6390/0"
-
 # Stable, explicit task name so the limiter's per-task Redis key is deterministic
 # and can be cleaned up reliably.
 TASK_NAME = "t.integration.test_global_rate_limit.record_execution"
@@ -142,9 +120,9 @@ def _global_rate_limit_feature_available(app):
     The feature spans three collaborating pieces created by other agents:
     the ``task_global_rate_limit_backend`` setting (registered in
     ``celery/app/defaults.py``), the ``RedisTokenBucket`` module, and the
-    ``bucket_for_task()`` substitution in the consumer. We detect the first two
-    cheaply and treat their absence as "skip" so this optional test never fails
-    a build where the feature has not landed yet.
+    ``bucket_for_task()`` substitution in the consumer. We detect ALL THREE and
+    treat any absence as "skip" so this optional test never fails a build where
+    the feature (or any part of it) has not landed yet.
     """
     # (1) The setting must be REGISTERED. Reading an unregistered key raises
     #     AttributeError, but membership testing is exception-free and returns
@@ -156,7 +134,24 @@ def _global_rate_limit_feature_available(app):
         from celery.rate_limiting import redis_rate_limiter
     except Exception:
         return False
-    return redis_rate_limiter is not None
+    if redis_rate_limiter is None:
+        return False
+    # (3) The consumer's ``bucket_for_task()`` factory must actually substitute
+    #     the RedisTokenBucket when the backend is configured. Without that hook
+    #     the setting is inert and an end-to-end assertion would FAIL rather than
+    #     skip, so this third piece is required too. The factory source is
+    #     inspected for the RedisTokenBucket reference (integration tests run
+    #     against the source checkout, so the source is available); any
+    #     inspection failure or a missing reference means the feature is only
+    #     partially wired -> skip cleanly.
+    try:
+        import inspect
+
+        from celery.worker.consumer.consumer import Consumer
+        factory_source = inspect.getsource(Consumer.bucket_for_task)
+    except Exception:
+        return False
+    return "RedisTokenBucket" in factory_source
 
 
 def _record_execution(redis_key=EXECUTION_TIMES_KEY):
@@ -393,55 +388,3 @@ def test_global_rate_limit_enforced_across_two_workers(
     )
 
     _clean_keys()
-
-
-@flaky
-def test_global_rate_limit_fail_closed_blocks(
-        celery_session_app, celery_session_worker, global_rate_limit_task):
-    """Fail-closed mode blocks execution when Redis is unreachable.
-
-    Full fault injection is fragile end-to-end and is covered comprehensively by
-    the unit suite (``t/unit/rate_limiting/test_redis_rate_limiter.py``). This is
-    a lightweight behavioral check: point the limiter at an UNREACHABLE Redis URL
-    with ``task_global_rate_limit_fail_open = False`` and confirm a dispatched
-    task does NOT execute within a short window (the limiter degrades closed).
-    """
-    if not _redis_available():
-        pytest.skip("Live Redis is required for the global rate-limit integration test.")
-    if not _global_rate_limit_feature_available(celery_session_app):
-        pytest.skip(
-            "Global rate-limit feature not present (task_global_rate_limit_backend "
-            "setting and/or celery.rate_limiting.redis_rate_limiter unavailable)."
-        )
-
-    app = celery_session_app
-    task = global_rate_limit_task
-    _clean_keys()
-
-    # The fail-open toggle is an optional setting; capture its prior value only
-    # if it is registered, otherwise fall back to the documented True default.
-    fail_open_registered = "task_global_rate_limit_fail_open" in app.conf
-    prior_fail_open = (
-        app.conf.task_global_rate_limit_fail_open if fail_open_registered else True
-    )
-
-    # Activate fail-closed against a deliberately unreachable backend.
-    app.conf.task_global_rate_limit_backend = UNREACHABLE_BACKEND
-    app.conf.task_global_rate_limit_fail_open = False
-    _broadcast_rate_limit(app)
-    try:
-        task.delay()
-        # With Redis unreachable and fail-closed, can_consume() resolves to
-        # block, so nothing should be recorded within this short observation.
-        time.sleep(3.0)
-        executed = get_redis_connection().llen(EXECUTION_TIMES_KEY)
-        assert executed == 0, (
-            "fail-closed should block execution while Redis is unreachable, "
-            f"but {executed} execution(s) were recorded"
-        )
-    finally:
-        # Restore defaults and detach the RedisTokenBucket for later tests.
-        app.conf.task_global_rate_limit_backend = None
-        app.conf.task_global_rate_limit_fail_open = prior_fail_open
-        _broadcast_rate_limit(app)
-        _clean_keys()

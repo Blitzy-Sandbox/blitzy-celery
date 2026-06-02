@@ -99,6 +99,10 @@ jobs:
           'test_canvas.py',
           'test_connection_recovery.py',
           'test_database_backend.py',
+          # Opt-in Redis-backed global rate-limiter e2e test; listed here so the
+          # scripts/check-ci-test-matrices hook (which requires the on-disk
+          # t/integration modules and this matrix to match exactly) stays green.
+          'test_global_rate_limit.py',
           'test_inspect.py',
           'test_loader.py',
           'test_mem_leak_in_exception_handling.py',
