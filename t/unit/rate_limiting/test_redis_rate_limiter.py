@@ -16,10 +16,12 @@ directly onto the instance, so the registered Lua scripts are never sent to a
 server and ``redis.Redis.from_url`` is never called. This keeps the suite free
 of any live I/O and importable even when ``redis-py`` is absent.
 """
-from unittest.mock import Mock, call
+from unittest.mock import Mock, call, patch
 
 import pytest
 
+from celery.exceptions import ImproperlyConfigured
+from celery.rate_limiting import redis_rate_limiter
 from celery.rate_limiting.redis_rate_limiter import RedisError, RedisTokenBucket
 from celery.utils.time import rate
 
@@ -153,6 +155,88 @@ class test_RedisTokenBucket:
         bucket._consume_script.side_effect = RedisError('redis is down')
 
         assert bucket.can_consume(1) is False
+
+    def test_malformed_backend_url_raises_improperly_configured(self):
+        """A malformed backend URL raises ImproperlyConfigured, not raw ValueError.
+
+        ``redis.Redis.from_url`` rejects an invalid URL with a builtins
+        ``ValueError``; the limiter converts that into a loud
+        :class:`~celery.exceptions.ImproperlyConfigured` (mirroring the
+        missing-``redis-py`` branch) so the *misconfiguration* surfaces clearly
+        rather than escaping as an opaque ``ValueError`` -- and is deliberately
+        NOT swallowed by the fail-open/fail-closed path, which targets transient
+        Redis *server* errors only. The module-level ``redis`` symbol is patched
+        so the ``from_url`` ``ValueError`` is simulated WITH or WITHOUT real
+        ``redis-py`` installed; no live server is required. This is the
+        regression test for the malformed-URL acceptance gap.
+        """
+        # No mocks are injected at the lazy seam here, so ``can_consume`` runs
+        # the real ``_get_client()`` -> ``redis.Redis.from_url`` path.
+        bucket = RedisTokenBucket(
+            10.0, capacity=1, backend_url='not-a-redis-url',
+            task_name='myapp.tasks.add', fail_open=True,
+        )
+        fake_redis = Mock(name='redis_module')
+        fake_redis.Redis.from_url.side_effect = ValueError(
+            'Redis URL must specify one of the following schemes '
+            '(redis://, rediss://, unix://)')
+
+        # ``fail_open=True`` is the strongest assertion: even in fail-open mode a
+        # bad URL must still raise rather than silently allow the task.
+        with patch.object(redis_rate_limiter, 'redis', fake_redis):
+            with pytest.raises(ImproperlyConfigured) as exc_info:
+                bucket.can_consume(1)
+
+        message = str(exc_info.value)
+        # The message is actionable: it names the offending setting and the
+        # accepted URL schemes so an operator can fix it immediately.
+        assert 'task_global_rate_limit_backend' in message
+        assert 'redis://' in message
+        # The original ValueError is chained (``raise ... from exc``) so the
+        # underlying redis-py cause stays available for debugging.
+        assert isinstance(exc_info.value.__cause__, ValueError)
+
+    def test_malformed_backend_url_expected_time_also_raises(self):
+        """expected_time() raises ImproperlyConfigured on a malformed URL too.
+
+        Both rate-decision methods funnel through ``_get_client()``, so the
+        malformed-URL misconfiguration is reported consistently from
+        :meth:`expected_time` as well -- it does not fall back to the bounded
+        backoff (that fallback is reserved for transient ``RedisError``).
+        """
+        bucket = RedisTokenBucket(
+            10.0, capacity=1, backend_url='not-a-redis-url',
+            task_name='myapp.tasks.add', fail_open=False,
+        )
+        fake_redis = Mock(name='redis_module')
+        fake_redis.Redis.from_url.side_effect = ValueError('bad scheme')
+
+        with patch.object(redis_rate_limiter, 'redis', fake_redis):
+            with pytest.raises(ImproperlyConfigured):
+                bucket.expected_time(1)
+
+    def test_malformed_backend_url_credentials_redacted(self):
+        """Credentials embedded in a malformed backend URL are not leaked.
+
+        The error message is built from ``maybe_sanitize_url`` so any password
+        embedded in ``task_global_rate_limit_backend`` is redacted (never
+        surfaced in the exception/traceback), per the AAP security requirement.
+        """
+        bucket = RedisTokenBucket(
+            10.0, capacity=1,
+            backend_url='http://user:supersecret@example.invalid/0',
+            task_name='myapp.tasks.add', fail_open=True,
+        )
+        fake_redis = Mock(name='redis_module')
+        fake_redis.Redis.from_url.side_effect = ValueError('bad scheme')
+
+        with patch.object(redis_rate_limiter, 'redis', fake_redis):
+            with pytest.raises(ImproperlyConfigured) as exc_info:
+                bucket.can_consume(1)
+
+        message = str(exc_info.value)
+        assert 'supersecret' not in message  # plaintext password never leaks
+        assert '**' in message  # the ``**`` redaction marker appears instead
 
     def test_per_task_key_namespacing(self):
         """Keys are namespaced per task name; distinct tasks never collide."""

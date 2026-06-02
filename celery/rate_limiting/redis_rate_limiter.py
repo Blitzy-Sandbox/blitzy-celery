@@ -91,6 +91,20 @@ installed. Install it (for example via the celery[redis] extra) to use the \
 global rate limiter, or unset the setting to fall back to per-worker limits.
 """
 
+#: Message raised as :class:`ImproperlyConfigured` when the configured backend
+#: URL is malformed -- ``redis.Redis.from_url`` rejects it with ``ValueError``.
+#: Like the missing-``redis-py`` case above this is a *misconfiguration* that no
+#: amount of retrying will fix, so it is surfaced loudly and is deliberately
+#: distinct from the fail-open/fail-closed path (which handles transient Redis
+#: *server* errors only). The ``%s`` is filled with the **sanitised** URL so any
+#: credentials embedded in the setting are never surfaced in the error.
+E_REDIS_BAD_URL = """
+The task_global_rate_limit_backend setting is not a valid Redis URL: %s. It \
+must use a redis://, rediss:// or unix:// scheme (for example \
+redis://localhost:6379/0). Fix the setting to a valid Redis URL, or unset it \
+to fall back to per-worker rate limits.
+"""
+
 #: Atomic token-bucket *consume* script. Refills the bucket from the Redis
 #: server clock (so all workers share one authoritative time source), then
 #: consumes ``requested`` tokens when available. Returns ``1`` when the request
@@ -217,16 +231,30 @@ class RedisTokenBucket(TokenBucket):
         The client is built on first use via ``redis.Redis.from_url`` (which
         opens no socket until the first command) and the two Lua scripts are
         registered on it (a local-only operation that does not contact Redis).
-        If the global backend is configured but ``redis-py`` is not installed
-        this raises :class:`~celery.exceptions.ImproperlyConfigured` -- a loud
-        misconfiguration, distinct from the fail-open/fail-closed path.
+        Two *misconfigurations* are surfaced loudly as
+        :class:`~celery.exceptions.ImproperlyConfigured` (each distinct from the
+        fail-open/fail-closed path, which handles only transient Redis *server*
+        errors): the global backend being configured while ``redis-py`` is not
+        installed, and the configured backend URL being malformed (rejected by
+        ``redis.Redis.from_url`` with ``ValueError``).
         """
         if self._redis_client is None:
             if redis is None:
                 raise ImproperlyConfigured(E_REDIS_MISSING.strip())
             # Independent connection from the configured URL -- NOT the broker
-            # or result_backend connection.
-            self._redis_client = redis.Redis.from_url(self._backend_url)
+            # or result_backend connection. A malformed URL is a permanent
+            # misconfiguration (not a transient server outage), so convert the
+            # raw redis-py ValueError into a loud ImproperlyConfigured -- mirroring
+            # the missing-redis-py branch above -- instead of silently
+            # fail-open/closed, which would hide the bad setting. The URL is
+            # sanitised so any embedded credentials never leak into the error.
+            try:
+                self._redis_client = redis.Redis.from_url(self._backend_url)
+            except ValueError as exc:
+                raise ImproperlyConfigured(
+                    E_REDIS_BAD_URL.strip()
+                    % maybe_sanitize_url(self._backend_url)
+                ) from exc
             # ``register_script`` does not contact Redis; the EVALSHA round trip
             # happens only when the returned Script is invoked.
             self._consume_script = self._redis_client.register_script(

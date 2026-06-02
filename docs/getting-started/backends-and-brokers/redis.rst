@@ -177,11 +177,16 @@ task's :attr:`~celery.app.task.Task.rate_limit` is enforced *per worker process*
 setting :setting:`task_global_rate_limit_backend` to a Redis URL (for example
 ``redis://localhost:6379/0``) instead enforces that limit *globally across the whole
 worker fleet*. This reuses the same ``celery[redis]`` extra already required above and
-opens its own independent Redis connection.
+opens its own independent Redis connection. If the configured Redis backend is
+unavailable, the limiter degrades gracefully according to
+:setting:`task_global_rate_limit_fail_open` -- *fail-open* by default (tasks are allowed
+to run so a coordination-layer outage never halts processing), or set it to ``False`` to
+*fail closed* and block tasks while Redis is unreachable.
 
 .. seealso::
 
-    :setting:`task_global_rate_limit_backend` in the configuration reference for full
+    :setting:`task_global_rate_limit_backend` and
+    :setting:`task_global_rate_limit_fail_open` in the configuration reference for full
     details.
 
 .. _redis-serverless:
