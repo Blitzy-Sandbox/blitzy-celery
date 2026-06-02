@@ -286,6 +286,12 @@ NAMESPACES = Namespace(
         default_exchange_type=Option('direct'),
         default_routing_key=Option(None, type='string'),  # taken from queue
         default_rate_limit=Option(type='string'),
+        # Opt-in Redis URL enabling GLOBAL (cross-worker) rate limiting for tasks;
+        # when unset, rate limiting stays per-worker (default behavior unchanged).
+        global_rate_limit_backend=Option(None, type='string'),
+        # Degradation mode when the Redis limiter backend is unreachable:
+        # True = fail-open (allow the task, the default); False = fail-closed (block).
+        global_rate_limit_fail_open=Option(True, type='bool'),
         default_priority=Option(None, type='string'),
         eager_propagates=Option(
             False, type='bool', old={'celery_eager_propagates_exceptions'},
