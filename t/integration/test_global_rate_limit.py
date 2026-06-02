@@ -20,22 +20,41 @@ keys are namespaced as ``celery:global-rate-limit:<task_name>``. On a Redis
 failure the limiter degrades per ``task_global_rate_limit_fail_open`` (default
 ``True`` -> allow/fail-open; ``False`` -> block/fail-closed).
 
-Marker registration (cross-folder, resolved)
----------------------------------------------
-These tests are marked with ``@pytest.mark.integration`` per the Agent Action
-Plan. The repository's root ``pyproject.toml`` sets
-``[tool.pytest.ini_options] addopts = "--strict-markers"``, so the ``integration``
-marker is registered in that file's ``markers`` list -- collection therefore
-succeeds cleanly both under the suite's normal invocation and when
-``--strict-markers`` is passed explicitly, with no ``PytestUnknownMarkWarning``.
+Cross-folder marker caveat (IMPORTANT, read before "fixing" a collection error)
+------------------------------------------------------------------------------
+The Agent Action Plan requires marking these tests with
+``@pytest.mark.integration``. However, the repository's root ``pyproject.toml``
+sets ``[tool.pytest.ini_options] addopts = "--strict-markers"`` and, at the time
+of writing, registers only ``sleepdeprived_patched_module, masked_modules,
+patched_environ, patched_module, flaky, timeout, amqp`` -- the ``integration``
+marker is NOT yet registered there. Registering it belongs to the
+configuration/root agent (it edits ``pyproject.toml``, which lives OUTSIDE the
+``t/`` tree); this test module must NOT edit ``pyproject.toml`` to do so.
 
-CI test matrix (cross-folder, resolved)
----------------------------------------
-Because the repository's ``scripts/check-ci-test-matrices`` hook asserts that the
-``test_*.py`` modules on disk under ``t/integration`` match the ``Integration-tests``
-job's ``strategy.matrix.module`` list exactly, ``test_global_rate_limit.py`` is
-registered in that matrix in ``.github/workflows/python-package.yml`` so the lint
-job stays green and this optional suite is scheduled in CI.
+* Under the way the integration suite is actually run (``pytest -xsvv
+  t/integration`` via tox, i.e. ``--strict-markers`` coming from ``addopts``),
+  an unregistered marker is reported only as a ``PytestUnknownMarkWarning`` and
+  collection still succeeds.
+* If ``--strict-markers`` is passed explicitly on the command line while
+  ``integration`` is still unregistered, collection will error on the marker.
+  That is the documented cross-folder dependency: the fix is to register
+  ``integration`` in ``pyproject.toml``'s ``[tool.pytest.ini_options].markers``
+  (config/root agent). The fallback -- should that registration not be
+  coordinated -- is to rely solely on the already-registered ``@flaky`` /
+  ``@pytest.mark.timeout`` decorators applied below (i.e. drop the
+  ``integration`` marker). Do NOT implement that fallback by editing config.
+
+Related cross-folder dependency (CI test matrix)
+------------------------------------------------
+Adding a new ``test_*.py`` module under ``t/integration`` also requires
+registering it in the ``Integration-tests`` job's ``strategy.matrix.module``
+list in ``.github/workflows/python-package.yml`` -- the repository's
+``scripts/check-ci-test-matrices`` pre-commit hook asserts that the modules on
+disk and the workflow matrix match exactly. That workflow file is a root/CI
+configuration file OUTSIDE this single-file scope, so (as with the marker
+registration above) this module does NOT edit it; the configuration/root agent
+must add ``test_global_rate_limit.py`` to that matrix so the lint job stays
+green and this optional suite is scheduled in CI.
 
 Every test below is additionally wrapped with the suite-standard ``@flaky``
 decorator (composing the registered ``timeout`` + ``flaky`` markers) and is

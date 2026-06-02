@@ -25,7 +25,6 @@ from celery import bootsteps, signals
 from celery.app.trace import build_tracer
 from celery.exceptions import (CPendingDeprecationWarning, InvalidTaskError, NotRegistered, WorkerShutdown,
                                WorkerTerminate)
-from celery.rate_limiting.redis_rate_limiter import RedisTokenBucket
 from celery.utils.functional import noop
 from celery.utils.log import get_logger
 from celery.utils.nodenames import gethostname
@@ -35,6 +34,11 @@ from celery.utils.time import humanize_seconds, rate
 from celery.worker import loops
 from celery.worker.state import (active_requests, maybe_shutdown, requests, reserved_requests, successful_requests,
                                  task_reserved)
+
+# Opt-in global (Redis-backed) rate-limiter bucket used by bucket_for_task() below;
+# pinned out of isort's alphabetical order (isort:skip) so this single feature import
+# stays grouped after the worker-state wiring, per the minimal-change requirement.
+from celery.rate_limiting.redis_rate_limiter import RedisTokenBucket  # isort:skip
 
 __all__ = ('Consumer', 'Evloop', 'dump_body')
 
