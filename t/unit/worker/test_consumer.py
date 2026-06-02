@@ -89,12 +89,19 @@ class test_Consumer(ConsumerTestCase):
         assert isinstance(bucket, RedisTokenBucket)
 
     def test_bucket_for_task_noop_when_rate_limit_falsy(self):
-        # Even with the global backend configured, a falsy rate_limit must be
-        # a complete no-op: factory returns None and NO Redis bucket is built.
+        # Even with the global backend configured, a falsy rate_limit must be a
+        # complete no-op: the factory returns None and NO Redis bucket is built.
+        # Exercise the REAL bucket_for_task seam for BOTH falsy values -- the
+        # default (None) AND an explicit 0 -- so this fails if the factory ever
+        # constructs a RedisTokenBucket for a falsy rate_limit.
         self.app.conf.task_global_rate_limit_backend = 'redis://localhost:6379/0'
 
         @self.app.task(shared=False)  # rate_limit defaults to None
         def task_none():
+            pass
+
+        @self.app.task(shared=False, rate_limit=0)  # explicit falsy rate_limit
+        def task_zero():
             pass
 
         c = self.get_consumer()
@@ -102,6 +109,7 @@ class test_Consumer(ConsumerTestCase):
         # the factory's module-level reference to the class (no `import redis`).
         with patch('celery.worker.consumer.consumer.RedisTokenBucket') as mock_rtb:
             assert c.bucket_for_task(task_none) is None
+            assert c.bucket_for_task(task_zero) is None
             mock_rtb.assert_not_called()
 
     def test_sets_heartbeat(self):
