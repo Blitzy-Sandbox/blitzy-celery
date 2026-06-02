@@ -166,6 +166,24 @@ use the ``additional_connection_errors`` key under
 
 Both dotted import strings and exception classes are supported.
 
+.. _redis-global-rate-limit:
+
+Global rate limiter
+-------------------
+
+Besides being usable as a broker and/or result backend, Redis can also act as the
+coordination backend for Celery's *optional* global task rate limiter. By default a
+task's :attr:`~celery.app.task.Task.rate_limit` is enforced *per worker process*;
+setting :setting:`task_global_rate_limit_backend` to a Redis URL (for example
+``redis://localhost:6379/0``) instead enforces that limit *globally across the whole
+worker fleet*. This reuses the same ``celery[redis]`` extra already required above and
+opens its own independent Redis connection.
+
+.. seealso::
+
+    :setting:`task_global_rate_limit_backend` in the configuration reference for full
+    details.
+
 .. _redis-serverless:
 
 Serverless
