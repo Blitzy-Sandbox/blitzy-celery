@@ -1034,6 +1034,32 @@ General
     maximum number of  requests per second), you must restrict to a given
     queue.
 
+    .. versionadded:: 5.7
+
+    Alternatively, you can make the limit *global* (cluster-wide) — shared
+    across **all** workers — by enabling the
+    :setting:`worker_rate_limits_global` setting. With it enabled, the task's
+    ``rate_limit`` (for example ``@app.task(rate_limit="10/s")``) becomes the
+    aggregate ceiling for the whole cluster: scaling from 1 to 10 workers keeps
+    the observed throughput at about 10/s instead of about 100/s. (Contrast
+    with the per-worker behavior described above, where the effective rate is
+    ``rate_limit`` multiplied by the number of workers.)
+
+    The global limiter coordinates through Redis. Point it at a specific Redis
+    server with :setting:`worker_rate_limit_url`; when that is unset it falls
+    back to :setting:`result_backend`, then :setting:`broker_url`, whenever
+    either is a Redis URL. Using it requires the redis extra
+    (``pip install "celery[redis]"``) and a reachable Redis server.
+
+    Runtime rate-limit changes also take effect cluster-wide, because the
+    bucket state lives in Redis keyed by task name. For example, calling
+    ``app.control.rate_limit("tasks.send_sms", "5/m")`` now applies across the
+    whole cluster.
+
+    If the limiter cannot reach Redis it *fails open*: it logs a warning and
+    degrades to per-worker rate limiting rather than halting task consumption —
+    a deliberate availability-over-strictness trade-off.
+
 .. attribute:: Task.time_limit
 
     The hard time limit, in seconds, for this task.
