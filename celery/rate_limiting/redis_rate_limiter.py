@@ -72,12 +72,38 @@ KEY_PREFIX = 'celery:global_rate_limit:'
 DEFAULT_SOCKET_CONNECT_TIMEOUT = 0.2
 DEFAULT_SOCKET_TIMEOUT = 0.2
 
+#: Default upper bound on the size of the limiter's Redis connection pool.
+#:
+#: redis-py's ``ConnectionPool`` defaults ``max_connections`` to an effectively
+#: unbounded value (``2**31``), which under a burst of highly-concurrent task
+#: dispatch could open an unbounded number of sockets and exhaust the worker's
+#: file descriptors or Redis' ``maxclients`` limit.  Because the limiter sits on
+#: the hot dispatch path and each :meth:`RedisRateLimiter.can_consume` holds a
+#: connection only for one sub-millisecond ``EVALSHA`` round-trip before
+#: returning it to the pool, a modest, explicitly-bounded ceiling is ample for
+#: realistic per-process concurrency while keeping resource usage predictable.
+#:
+#: This default is tunable per instance via the ``max_connections`` constructor
+#: argument and is overridden by a ``max_connections`` query parameter embedded
+#: in the backend URL (redis-py resolves URL querystring args ahead of kwargs).
+#: Operators running very high single-process concurrency (for example large
+#: gevent/eventlet pools) should size it to their worker concurrency.
+DEFAULT_MAX_CONNECTIONS = 100
+
 #: Atomic token-bucket refill-and-consume implemented as a single Lua script.
 #:
 #: Evaluating the whole read-modify-write inside Redis (one ``EVAL``) makes the
 #: check-and-consume indivisible: two workers calling concurrently are
 #: serialised by Redis, eliminating the cross-worker race that a multi-round
 #: ``GET``/``SET`` sequence would suffer from.
+#:
+#: Beyond per-call atomicity, the script keeps the stored bucket timestamp
+#: **monotonic**: a stale or out-of-order client ``now`` (``now < last``) is
+#: clamped up to ``last`` before refilling, so a regressed timestamp can never
+#: cause the same elapsed interval to be refilled twice.  This is what makes the
+#: configured rate a true aggregate ceiling even when independent workers stamp
+#: requests from skewed wall clocks (the alternative -- a non-monotonic
+#: timestamp -- can overgrant above the ceiling).
 #:
 #: Contract::
 #:
@@ -113,10 +139,21 @@ if last == nil then
 end
 
 -- 2. Refill: add the tokens accrued since the last update, capped at capacity.
-local elapsed = now - last
-if elapsed < 0 then
-    elapsed = 0
+-- Guard against a stale/out-of-order client timestamp: clamp ``now`` UP to the
+-- stored ``last`` so the bucket timestamp is MONOTONIC and never regresses
+-- (QA Issue 1).  With client-side wall clocks, concurrent workers can deliver
+-- timestamps out of order; persisting a regressed timestamp (step 4) would let
+-- a later call re-refill the SAME elapsed interval a second time, overgranting
+-- above the aggregate cluster-wide ceiling (e.g. 12 tokens where 11 is the
+-- max).  Clamping here makes ``elapsed`` 0 for a stale call AND makes step 4
+-- persist ``timestamp = max(last, now)``, so the same interval is never
+-- counted twice.  Under a forward-skewed clock this is conservative (it may
+-- briefly under-grant) which is the correct, safe bias for a rate limiter --
+-- it never overgrants.
+if now < last then
+    now = last
 end
+local elapsed = now - last
 tokens = tokens + (elapsed * rate)
 if tokens > capacity then
     tokens = capacity
@@ -138,7 +175,9 @@ else
     end
 end
 
--- 4. Persist the new state.
+-- 4. Persist the new state.  ``now`` was clamped up to ``last`` in step 2, so
+--    the stored timestamp is monotonic (never moves backwards) and the same
+--    refill interval can never be consumed twice across out-of-order calls.
 redis.call('HSET', KEYS[1], 'tokens', tokens, 'timestamp', now)
 
 -- 5. Expire the key so windows reset and a crashed worker never holds tokens
@@ -200,11 +239,19 @@ class RedisRateLimiter(BaseRateLimiter):
             (the Lua ``EVAL``/``EVALSHA`` round-trip) before failing open.
             Defaults to :data:`DEFAULT_SOCKET_TIMEOUT`.  A ``socket_timeout``
             query parameter in ``backend_url`` overrides this value.
+        max_connections (int, optional): Upper bound on the size of the Redis
+            connection pool.  Defaults to :data:`DEFAULT_MAX_CONNECTIONS` so the
+            pool is explicitly bounded rather than effectively unbounded
+            (redis-py's ``ConnectionPool`` default of ``2**31``), keeping socket
+            usage predictable under high-concurrency dispatch.  A
+            ``max_connections`` query parameter in ``backend_url`` overrides this
+            value (redis-py: URL args win).
     """
 
     def __init__(self, backend_url, capacity=None, default_capacity=None,
                  socket_connect_timeout=DEFAULT_SOCKET_CONNECT_TIMEOUT,
-                 socket_timeout=DEFAULT_SOCKET_TIMEOUT):
+                 socket_timeout=DEFAULT_SOCKET_TIMEOUT,
+                 max_connections=DEFAULT_MAX_CONNECTIONS):
         # Keep the raw URL for building the client, but only ever log/store a
         # sanitized copy so embedded credentials are never written to logs.
         self._url = backend_url
@@ -223,6 +270,11 @@ class RedisRateLimiter(BaseRateLimiter):
         # query string takes precedence (redis-py resolves URL args first).
         self._socket_connect_timeout = socket_connect_timeout
         self._socket_timeout = socket_timeout
+        # Explicit, bounded pool ceiling so a dispatch burst cannot open an
+        # unbounded number of sockets (redis-py's ConnectionPool otherwise
+        # defaults to ~2**31).  Overridden by any ``max_connections`` query
+        # parameter in the URL (redis-py resolves URL args ahead of kwargs).
+        self._max_connections = max_connections
         # Lazily-built client/script and a one-shot guard so the fallback
         # warning is logged at most once per limiter instance (no log flooding
         # under high task volume).  No connection is opened in __init__ so
@@ -264,6 +316,9 @@ class RedisRateLimiter(BaseRateLimiter):
                     self._url,
                     socket_connect_timeout=self._socket_connect_timeout,
                     socket_timeout=self._socket_timeout,
+                    # Bound the pool explicitly (see DEFAULT_MAX_CONNECTIONS);
+                    # a ``max_connections`` query param in the URL overrides it.
+                    max_connections=self._max_connections,
                 )
                 self._client = redis.Redis(connection_pool=pool)
                 # Register the script once; subsequent calls reuse the cached

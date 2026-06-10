@@ -444,6 +444,104 @@ class test_RedisRateLimiter:
             assert inspector.exists(key)
             assert inspector.pttl(key) > 0
 
+    def test_stale_timestamp_does_not_overgrant(self):
+        """A stale/out-of-order timestamp must not regress the bucket and overgrant.
+
+        Deterministic reproduction of the cluster-wide overgrant a *non*-monotonic
+        bucket timestamp permits.  Independent workers stamp each ``can_consume``
+        from their own wall clock, so a slow/late worker can deliver a timestamp
+        EARLIER than one already recorded.  If the Lua script persisted that lower
+        timestamp, a subsequent call would re-refill the SAME elapsed interval a
+        second time and grant a token above the aggregate ceiling.  At ``"10/s"``
+        (capacity 10) no more than 11 tokens may be granted by ``t0 + 0.1`` (10
+        initial + exactly 1 refilled over 0.1s); the stale call must not yield a
+        12th.
+
+        This is the regression guard for the timestamp-regression overgrant: it
+        FAILS against a script that stores ``now`` unconditionally (granting 12)
+        and PASSES once the script clamps ``now`` up to ``last`` so the stored
+        timestamp is monotonic.
+        """
+        server = fakeredis.FakeServer()
+        granted = 0
+        # The clock is driven explicitly so the out-of-order call is exact and
+        # the refill window is a precise 0.1s -- no sleeping, fully deterministic.
+        with shared_fake_redis(server), frozen_time(1000.0) as ft:
+            limiter = RedisRateLimiter(backend_url=URL)
+            # Drain the full bucket at t0 (capacity = max(1.0, 10.0) = 10).
+            for _ in range(10):
+                ok, _ = limiter.can_consume('stale_task', '10/s')
+                granted += int(ok)
+            assert granted == 10
+            # 11th at t0 is denied -- the bucket is empty and no time elapsed.
+            assert limiter.can_consume('stale_task', '10/s')[0] is False
+            # Advance 0.1s: +0.1 * 10 = 1 token -> the 11th token is granted.
+            ft.time.return_value = 1000.1
+            ok, _ = limiter.can_consume('stale_task', '10/s')
+            assert ok is True
+            granted += 1
+            # STALE/out-of-order call at t0 (< last = 1000.1): must be denied and,
+            # with a monotonic timestamp, must NOT rewind the stored timestamp.
+            ft.time.return_value = 1000.0
+            assert limiter.can_consume('stale_task', '10/s')[0] is False
+            # Back at t0 + 0.1: no NEW time has elapsed since the 1000.1 grant, so
+            # a correct limiter denies (no 12th token).  The pre-fix bug re-filled
+            # the same 0.1s interval here and granted a spurious 12th token.
+            ft.time.return_value = 1000.1
+            ok, _ = limiter.can_consume('stale_task', '10/s')
+            granted += int(ok)
+            assert ok is False
+        # The aggregate ceiling holds: 10 initial capacity + exactly 1 refill.
+        assert granted == 11
+
+    def test_stale_timestamp_not_persisted_backwards(self):
+        """The stored bucket timestamp is monotonic and never regresses.
+
+        Directly asserts the monotonic-timestamp invariant underpinning the
+        aggregate-ceiling guarantee: after a later call advances the bucket
+        clock, an out-of-order call carrying an EARLIER timestamp must not rewind
+        the persisted ``timestamp`` field -- otherwise a following call would
+        re-refill an already-counted interval and overgrant.
+        """
+        server = fakeredis.FakeServer()
+        key = f'{KEY_PREFIX}ts_monotonic_task'
+        with shared_fake_redis(server), frozen_time(1000.0) as ft:
+            limiter = RedisRateLimiter(backend_url=URL)
+            limiter.can_consume('ts_monotonic_task', '10/s')   # stamps 1000.0
+            ft.time.return_value = 1005.0
+            limiter.can_consume('ts_monotonic_task', '10/s')   # advances to 1005.0
+            ft.time.return_value = 1000.0                       # stale/out-of-order
+            limiter.can_consume('ts_monotonic_task', '10/s')
+            inspector = fakeredis.FakeStrictRedis(server=server)
+            stored = inspector.hget(key, 'timestamp')
+            stored_ts = float(
+                stored.decode() if isinstance(stored, bytes) else stored)
+        # The stale call must NOT have rewound the timestamp below 1005.0.
+        assert stored_ts == pytest.approx(1005.0)
+
+    def test_connection_pool_is_bounded(self):
+        """The Redis connection pool is built with an explicit, bounded size.
+
+        redis-py's ``ConnectionPool`` otherwise defaults ``max_connections`` to an
+        effectively unbounded value (``2**31``); the limiter must instead pass an
+        explicit, bounded ceiling so a burst of highly-concurrent dispatch cannot
+        open an unbounded number of sockets, and that ceiling must be tunable.
+        """
+        server = fakeredis.FakeServer()
+        with shared_fake_redis(server) as fake:
+            limiter = RedisRateLimiter(backend_url=URL)
+            limiter.can_consume('pool_bound_task', '10/s')  # forces pool build
+            _, kwargs = fake.ConnectionPool.from_url.call_args
+            assert kwargs['max_connections'] == rrl_module.DEFAULT_MAX_CONNECTIONS
+            assert kwargs['max_connections'] < 2 ** 31
+        # An explicit override flows straight through to pool construction.
+        server2 = fakeredis.FakeServer()
+        with shared_fake_redis(server2) as fake2:
+            limiter2 = RedisRateLimiter(backend_url=URL, max_connections=5)
+            limiter2.can_consume('pool_bound_task2', '10/s')
+            _, kwargs2 = fake2.ConnectionPool.from_url.call_args
+            assert kwargs2['max_connections'] == 5
+
 
 class test_get_global_rate_limiter:
     """Factory wiring: default-off, opt-in, and never-raises behaviour."""

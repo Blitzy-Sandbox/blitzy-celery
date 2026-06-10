@@ -13,6 +13,7 @@ is reachable, the Redis-backed tests SKIP cleanly (they never ERROR), mirroring
 the ``test_task_redis_result_backend`` pattern in ``t/integration/test_tasks.py``.
 """
 import os
+import threading
 import time
 
 import pytest
@@ -89,6 +90,68 @@ class test_global_rate_limit:
         assert total_allowed <= 7
         # Proves coordination, not N x rate: far below the uncoordinated bound.
         assert total_allowed < total_attempts
+
+    @flaky
+    def test_concurrent_workers_respect_aggregate_ceiling(self, redis_backend_url):
+        """Many threads dispatching at once must not exceed the cluster ceiling.
+
+        A real, concurrent stress of the aggregate ceiling that complements the
+        deterministic unit regression test
+        (``test_stale_timestamp_does_not_overgrant``).  Independent limiter
+        instances -- each a separate simulated "worker" -- stamp ``can_consume``
+        from their own wall clock yet reach the one shared Redis bucket in
+        racing, out-of-order sequences.  With a *monotonic* bucket timestamp the
+        shared ``"50/s"`` bucket (capacity ``max(1.0, 50.0) == 50``) grants at
+        most its capacity plus the negligible refill accrued over the few-ms
+        burst -- NEVER ``workers`` tokens.  A non-monotonic timestamp regression
+        re-refills already-counted intervals and overgrants above 50 here, so
+        this test would catch a reintroduction of that defect.
+
+        A :class:`threading.Barrier` releases every thread as simultaneously as
+        possible to maximise the out-of-order arrival the guard targets; it is
+        ``@flaky`` because absolute grant counts depend on real-time scheduling.
+        """
+        task_name = 't.integration.rate_limiting.concurrent'
+        rate = '50/s'  # capacity = max(1.0, 50.0) = 50
+        get_redis_connection().delete(f'celery:global_rate_limit:{task_name}')
+
+        workers = 100
+        limiters = [RedisRateLimiter(backend_url=redis_backend_url)
+                    for _ in range(workers)]
+        # Warm up each client/script on a SEPARATE key so the timed burst runs
+        # only the atomic EVAL on the shared key (its bucket stays pristine/full).
+        for limiter in limiters:
+            limiter.can_consume(f'{task_name}.warmup', rate)
+
+        allowed = []
+        lock = threading.Lock()
+        barrier = threading.Barrier(workers)
+
+        def worker(limiter):
+            barrier.wait()  # release all threads as close to simultaneously as possible
+            ok, _retry = limiter.can_consume(task_name, rate)
+            if ok:
+                with lock:
+                    allowed.append(1)
+
+        threads = [threading.Thread(target=worker, args=(limiter,))
+                   for limiter in limiters]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        total_allowed = len(allowed)
+        # At least one grant (the bucket started full)...
+        assert total_allowed >= 1
+        # ...never more than the capacity (50) plus a tiny refill margin for the
+        # few milliseconds the burst takes.  A timestamp-regression overgrant
+        # (the original defect granted 54 here) trips this bound.
+        assert total_allowed <= 52
+        # And far below the uncoordinated bound (`workers`), proving the limit is
+        # cluster-wide coordinated, NOT enforced independently per worker.
+        assert total_allowed < workers
+        get_redis_connection().delete(f'celery:global_rate_limit:{task_name}')
 
     @flaky
     def test_window_resets_and_refills_over_time(self, redis_backend_url):
