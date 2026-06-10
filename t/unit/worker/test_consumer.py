@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, Mock, call, patch
 import pytest
 from amqp import ChannelError
 from billiard.exceptions import RestartFreqExceeded
+from kombu.utils.limits import TokenBucket
 
 from celery import bootsteps
 from celery.contrib.testing.mocks import ContextMock
@@ -20,6 +21,7 @@ from celery.worker.consumer.gossip import Gossip
 from celery.worker.consumer.heart import Heart
 from celery.worker.consumer.mingle import Mingle
 from celery.worker.consumer.tasks import Tasks
+from celery.worker.rate_limits import RedisTokenBucket
 from celery.worker.state import active_requests, successful_requests
 
 
@@ -845,6 +847,57 @@ class test_Consumer(ConsumerTestCase):
 
         # Should not modify can_consume method for non-Redis brokers
         assert consumer.task_consumer.channel.qos.can_consume == original_can_consume
+
+    def test_bucket_for_task_local_when_global_off(self):
+        # Global rate limiting OFF (the default) for a task that declares a
+        # rate_limit must yield a plain per-worker kombu TokenBucket and never
+        # the Redis-backed bucket; the lazy limiter factory is never consulted.
+        @self.app.task(rate_limit='10/s', shared=False)
+        def trate():
+            pass
+
+        c = self.get_consumer()
+        # The default for the opt-in flag must be falsy; assert it explicitly.
+        assert not self.app.conf.worker_rate_limits_global
+        with patch('celery.worker.rate_limits.get_limiter_client') as glc:
+            bucket = c.bucket_for_task(trate)
+            assert isinstance(bucket, TokenBucket)
+            # RedisTokenBucket subclasses TokenBucket, so the isinstance check
+            # above also holds for the Redis bucket -- prove the local path by
+            # asserting the bucket is NOT a RedisTokenBucket.
+            assert not isinstance(bucket, RedisTokenBucket)
+            glc.assert_not_called()
+
+    def test_bucket_for_task_redis_when_global_on(self):
+        # Global rate limiting ON for a task that declares a rate_limit must
+        # yield a RedisTokenBucket keyed by the app-namespaced per-task key,
+        # built through the lazily imported get_limiter_client factory.
+        @self.app.task(rate_limit='10/s', shared=False)
+        def trate():
+            pass
+
+        c = self.get_consumer()
+        self.app.conf.worker_rate_limits_global = True
+        with patch('celery.worker.rate_limits.get_limiter_client') as glc:
+            # A MagicMock client makes register_script() auto-return a Mock so
+            # RedisTokenBucket is constructed with zero real Redis I/O.
+            glc.return_value = MagicMock(name='limiter_client')
+            bucket = c.bucket_for_task(trate)
+            assert isinstance(bucket, RedisTokenBucket)
+            glc.assert_called_once_with(self.app)
+            assert bucket.key == (
+                f"celery:rate_limit:{self.app.main or 'celery'}:{trate.name}"
+            )
+
+    def test_bucket_for_task_none_without_rate_limit(self):
+        # A task without a rate_limit yields None regardless of the global flag;
+        # the falsy limit short-circuits before the flag or Redis is consulted.
+        c = self.get_consumer()
+        with patch('celery.worker.rate_limits.get_limiter_client') as glc:
+            assert c.bucket_for_task(self.add) is None
+            self.app.conf.worker_rate_limits_global = True
+            assert c.bucket_for_task(self.add) is None
+            glc.assert_not_called()
 
 
 @pytest.mark.parametrize(
