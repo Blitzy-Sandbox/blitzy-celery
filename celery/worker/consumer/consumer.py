@@ -32,6 +32,7 @@ from celery.utils.objects import Bunch
 from celery.utils.text import truncate
 from celery.utils.time import humanize_seconds, rate
 from celery.worker import loops
+from celery.worker.global_ratelimit import GlobalTokenBucket
 from celery.worker.state import (active_requests, maybe_shutdown, requests, reserved_requests, successful_requests,
                                  task_reserved)
 
@@ -295,7 +296,18 @@ class Consumer:
 
     def bucket_for_task(self, type):
         limit = rate(getattr(type, 'rate_limit', None))
-        return TokenBucket(limit, capacity=1) if limit else None
+        if not limit:
+            return None
+        # Opt-in Redis-backed global rate limiter: enforce the configured rate as a
+        # single aggregate ceiling across the whole worker pool. Falls back to the
+        # default per-worker TokenBucket when disabled or if Redis is unavailable.
+        url = self.app.conf.worker_global_rate_limit_url
+        if self.app.conf.worker_global_rate_limit and url:
+            try:
+                return GlobalTokenBucket(limit, capacity=1, redis_url=url, key=type.name)
+            except Exception:  # pragma: no cover - degrade to per-worker limiting
+                pass
+        return TokenBucket(limit, capacity=1)
 
     def reset_rate_limits(self):
         self.task_buckets.update(
