@@ -13,6 +13,9 @@ The feature is **default-off** and **never crashes the worker**:
 
 * :class:`~celery.rate_limiting.base.BaseRateLimiter` -- the backend-agnostic
   contract exposing a single atomic ``can_consume`` decision.
+* :exc:`~celery.rate_limiting.base.RateLimiterUnavailable` -- raised by a
+  limiter to signal its backend is unavailable so the worker falls back to
+  per-process limiting (kept distinct from a real grant).
 * :class:`~celery.rate_limiting.redis_rate_limiter.RedisRateLimiter` -- the
   concrete Redis token-bucket backend (atomic Lua, graceful fallback).
 * :func:`get_global_rate_limiter` -- the factory the worker dispatch strategy
@@ -27,10 +30,15 @@ explicitly enabled.
 """
 from __future__ import annotations
 
-from celery.rate_limiting.base import BaseRateLimiter
+from celery.rate_limiting.base import BaseRateLimiter, RateLimiterUnavailable
 from celery.rate_limiting.redis_rate_limiter import RedisRateLimiter
 
-__all__ = ('BaseRateLimiter', 'RedisRateLimiter', 'get_global_rate_limiter')
+__all__ = (
+    'BaseRateLimiter',
+    'RateLimiterUnavailable',
+    'RedisRateLimiter',
+    'get_global_rate_limiter',
+)
 
 
 def get_global_rate_limiter(app):

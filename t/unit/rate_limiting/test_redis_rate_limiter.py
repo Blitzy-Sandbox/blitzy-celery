@@ -32,14 +32,40 @@ import pytest
 # ``redis`` (redis-py) supplies the exception classes the limiter catches.
 fakeredis = pytest.importorskip('fakeredis')
 pytest.importorskip('redis')
+# The limiter is implemented as a Redis Lua script and these tests EXECUTE that
+# Lua under ``fakeredis``, which requires fakeredis' optional ``[lua]`` extra
+# (the ``lupa`` package).  A plain ``fakeredis`` install WITHOUT Lua support
+# would error at EVAL time instead of skipping, so guard explicitly on ``lupa``
+# AND smoke-test a trivial ``EVAL`` -- whichever check trips, the whole module
+# SKIPS cleanly (never ERRORs), as the checkpoint requires.
+pytest.importorskip(
+    'lupa',
+    reason="fakeredis[lua] (the 'lupa' package) is required to execute the "
+           "limiter's Lua token-bucket script",
+    # Skip (not error) on ANY ImportError -- e.g. a present-but-broken ``lupa``
+    # -- and stay forward-compatible with pytest 9.1's stricter default.
+    exc_type=ImportError,
+)
+try:
+    if fakeredis.FakeStrictRedis().eval('return 1', 0) != 1:
+        raise RuntimeError('unexpected EVAL result')
+except Exception as exc:  # pragma: no cover - environment-dependent skip
+    pytest.skip(
+        f'fakeredis cannot execute Lua scripts ({exc!r}); install '
+        'fakeredis[lua] to run the global rate-limiter unit tests',
+        allow_module_level=True,
+    )
 
 try:
     from redis import exceptions as redis_exceptions
 except ImportError:  # pragma: no cover
     redis_exceptions = None
 
+from kombu.utils.url import maybe_sanitize_url  # noqa: E402
+
 import celery.rate_limiting.redis_rate_limiter as rrl_module  # noqa: E402
-from celery.rate_limiting import BaseRateLimiter, RedisRateLimiter, base, get_global_rate_limiter  # noqa: E402
+from celery.rate_limiting import (BaseRateLimiter, RateLimiterUnavailable, RedisRateLimiter, base,  # noqa: E402
+                                  get_global_rate_limiter)
 from celery.utils.time import rate as rate_to_tps  # noqa: E402
 
 #: Runtime logger name of the limiter module (``get_logger(__name__)``); used to
@@ -142,8 +168,10 @@ class test_BaseRateLimiter:
         assert limiter.can_consume('some.task', '10/s') == (True, 0.0)
 
     def test_all_exports(self):
-        """``base.__all__`` exposes exactly the abstract base class."""
-        assert base.__all__ == ('BaseRateLimiter',)
+        """``base.__all__`` exposes the base class and the fallback signal."""
+        # ``RateLimiterUnavailable`` is part of the limiter contract: it is the
+        # dedicated exception a backend raises to request per-process fallback.
+        assert base.__all__ == ('BaseRateLimiter', 'RateLimiterUnavailable')
 
 
 class test_RedisRateLimiter:
@@ -178,40 +206,47 @@ class test_RedisRateLimiter:
         assert denied_retries  # there must have been denials
         assert all(retry > 0 for retry in denied_retries)
 
-    def test_missing_library_fallback_warns_once(self, caplog):
-        """A missing redis-py library fails open with exactly one warning."""
-        # Defensive: make sure the limiter's logger propagates to the root
-        # handler ``caplog`` installs (do NOT touch the shared conftest).
-        logging.getLogger(LOGGER_NAME).propagate = True
-        # ``redis is None`` => ``_get_client`` returns None => warn + fall back.
+    def test_missing_library_fallback_warns_once(self, caplog, monkeypatch):
+        """A missing redis-py library signals fallback with exactly one warning."""
+        # Route the limiter's logger to caplog's root handler, but via
+        # ``monkeypatch`` so the original ``propagate`` value is RESTORED after
+        # the test -- no logging configuration leaks into later tests.
+        monkeypatch.setattr(logging.getLogger(LOGGER_NAME), 'propagate', True)
+        # With ``redis is None`` the client cannot be built, so the limiter
+        # warns once and RAISES RateLimiterUnavailable (a missing backend is NOT
+        # a grant): the worker must fall back to the per-process limiter.
         with patch.object(rrl_module, 'redis', None):
             limiter = RedisRateLimiter(backend_url=URL)
             with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
-                first = limiter.can_consume('t', '10/s')
-                # A second call on the SAME instance must NOT warn again.
-                second = limiter.can_consume('t', '10/s')
-        assert first == (True, 0.0)
-        assert second == (True, 0.0)
+                with pytest.raises(RateLimiterUnavailable):
+                    limiter.can_consume('t', '10/s')
+                # A second call on the SAME instance also raises but must NOT
+                # warn again (one warning per instance -- no log flooding).
+                with pytest.raises(RateLimiterUnavailable):
+                    limiter.can_consume('t', '10/s')
         records = [r for r in caplog.records
                    if r.name == LOGGER_NAME and r.levelname == 'WARNING']
         assert len(records) == 1
 
-    def test_connection_error_fallback_warns_once(self, caplog):
-        """A Redis connection error during EVAL fails open with one warning."""
-        logging.getLogger(LOGGER_NAME).propagate = True
+    def test_connection_error_fallback_warns_once(self, caplog, monkeypatch):
+        """A Redis connection error during EVAL signals fallback with one warning."""
+        monkeypatch.setattr(logging.getLogger(LOGGER_NAME), 'propagate', True)
 
         # --- Scenario 1: a realistically disconnected fakeredis server.  The
         # registered script raises a genuine redis.exceptions.ConnectionError
-        # when the Lua EVAL is attempted, exercising can_consume's error path.
+        # when the Lua EVAL is attempted, exercising can_consume's error path:
+        # it warns once and RAISES RateLimiterUnavailable to request fallback.
         server = fakeredis.FakeServer()
         server.connected = False
         with shared_fake_redis(server):
             limiter = RedisRateLimiter(backend_url=URL)
             with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
-                first = limiter.can_consume('t', '10/s')
-                second = limiter.can_consume('t', '10/s')
-        assert first == (True, 0.0)
-        assert second == (True, 0.0)
+                with pytest.raises(RateLimiterUnavailable):
+                    limiter.can_consume('t', '10/s')
+                # A second call on the SAME instance also raises but must NOT
+                # warn again (one warning per instance -- no log flooding).
+                with pytest.raises(RateLimiterUnavailable):
+                    limiter.can_consume('t', '10/s')
         records = [r for r in caplog.records
                    if r.name == LOGGER_NAME and r.levelname == 'WARNING']
         assert len(records) == 1
@@ -230,10 +265,12 @@ class test_RedisRateLimiter:
         with patch.object(rrl_module, 'redis', fake_redis_attr):
             limiter2 = RedisRateLimiter(backend_url=URL)
             with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
-                result2 = limiter2.can_consume('t', '10/s')
-        assert result2 == (True, 0.0)
+                with pytest.raises(RateLimiterUnavailable):
+                    limiter2.can_consume('t', '10/s')
         # The consume is a single registered-script EVAL keyed per task; ``ANY``
-        # matches the [tps, capacity, now, requested] argument vector.
+        # matches the [tps, capacity, now, requested] argument vector.  This is a
+        # public-seam assertion (patching the module's ``redis`` attribute), not
+        # a private-internals one.
         failing_script.assert_called_once_with(
             keys=[f'{KEY_PREFIX}t'], args=ANY)
         assert failing_script.call_args == call(keys=[f'{KEY_PREFIX}t'], args=ANY)
@@ -241,34 +278,41 @@ class test_RedisRateLimiter:
                     if r.name == LOGGER_NAME and r.levelname == 'WARNING']
         assert len(records2) == 1
 
-    def test_fallback_warning_sanitizes_url(self, caplog):
+    def test_fallback_warning_sanitizes_url(self, caplog, monkeypatch):
         """The fallback warning logs a sanitized URL, never raw credentials."""
-        logging.getLogger(LOGGER_NAME).propagate = True
+        monkeypatch.setattr(logging.getLogger(LOGGER_NAME), 'propagate', True)
         with patch.object(rrl_module, 'redis', None):
             limiter = RedisRateLimiter(backend_url=URL_WITH_SECRET)
             with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
-                result = limiter.can_consume('t', '10/s')
-        assert result == (True, 0.0)
-        # The embedded password must be masked everywhere it could surface.
+                with pytest.raises(RateLimiterUnavailable):
+                    limiter.can_consume('t', '10/s')
+        # Assert ONLY on publicly-observable output (the captured log text), not
+        # on any private attribute: the embedded password must never appear,
+        # while the sanitized URL (host preserved, secret masked by the same
+        # ``maybe_sanitize_url`` helper the limiter uses) must.
         assert 'secret' not in caplog.text
-        assert 'secret' not in limiter._sanitized_url
-        # The sanitized URL is what gets logged, and the host is preserved.
-        assert limiter._sanitized_url in caplog.text
         assert 'localhost' in caplog.text
+        assert maybe_sanitize_url(URL_WITH_SECRET) in caplog.text
 
     def test_no_rate_limit_is_noop(self):
         """An unset/zero rate is a pure no-op that never touches Redis."""
-        limiter = RedisRateLimiter(backend_url=URL)
         # ``rate`` yields 0 for each of these, so the limiter must short-circuit
         # to (True, 0.0) WITHOUT ever building a client / hitting Redis.
         assert rate_to_tps(None) == 0
         assert rate_to_tps(0) == 0
         assert rate_to_tps('0/s') == 0
-        with patch.object(limiter, '_get_client') as mock_get_client:
+        # Patch the PUBLIC seam (the module's ``redis`` attribute) with a fake
+        # module and assert the no-op path never constructs a client through it
+        # -- proving it returns before ANY backend interaction, without reaching
+        # into the limiter's private ``_get_client``.
+        fake_redis_attr = Mock(name='redis_module')
+        with patch.object(rrl_module, 'redis', fake_redis_attr):
+            limiter = RedisRateLimiter(backend_url=URL)
             for noop_rate in (None, 0, '0/s'):
                 assert limiter.can_consume('t', noop_rate) == (True, 0.0)
-            # The no-op path returns before consulting the backend at all.
-            mock_get_client.assert_not_called()
+            # No client/pool was ever built: the backend was never consulted.
+            fake_redis_attr.ConnectionPool.from_url.assert_not_called()
+            fake_redis_attr.Redis.assert_not_called()
 
         # Reinforcement: with a real shared keyspace, no-op rates write nothing.
         server = fakeredis.FakeServer()
@@ -278,6 +322,26 @@ class test_RedisRateLimiter:
                 assert limiter2.can_consume('noop_task', noop_rate) == (True, 0.0)
             inspector = fakeredis.FakeStrictRedis(server=server)
             assert inspector.keys('*') == []
+
+    def test_rate_parser_locked_values(self):
+        """Lock the EXACT tokens-per-second the parser yields for each format.
+
+        ``test_rate_formats_enforced`` only checks integer burst counts, and
+        ``"100/m"`` and ``"1000/h"`` both grant a single initial token -- so a
+        regression that mis-parsed every rate as ``1/s`` would still pass it.
+        Pin the precise fractional rates here so such drift is caught: the
+        limiter consumes ``rate_to_tps(rate)`` tokens/sec, and these are the
+        values it must receive.
+        """
+        assert rate_to_tps('10/s') == pytest.approx(10.0)
+        assert rate_to_tps('100/m') == pytest.approx(100 / 60)    # ~1.6667/s
+        assert rate_to_tps('1000/h') == pytest.approx(1000 / 3600)  # ~0.2778/s
+        # Unset/zero rates parse to 0 (the no-op sentinel), NOT a positive rate.
+        assert rate_to_tps(None) == 0
+        assert rate_to_tps(0) == 0
+        assert rate_to_tps('0/s') == 0
+        # ``None`` and ``0`` must agree -- both are the no-op sentinel.
+        assert rate_to_tps(None) == rate_to_tps(0)
 
     @pytest.mark.parametrize('rate_str, expected_allowed', [
         ('10/s', 10),
@@ -340,11 +404,14 @@ class test_RedisRateLimiter:
         with shared_fake_redis(server), frozen_time():
             limiters = [RedisRateLimiter(backend_url=URL)
                         for _ in range(n_workers)]
-            # Pre-build each limiter's client/script up front so the threaded
-            # section only performs the atomic EVAL (and avoids any mock
-            # side-effect race when constructing the stand-in clients).
+            # Pre-build each limiter's client/script up front -- via a PUBLIC
+            # warm-up consume on a SEPARATE key -- so the threaded section only
+            # performs the atomic EVAL on ``atomic_task`` and avoids any mock
+            # side-effect race when constructing the stand-in clients.  Using a
+            # different task name leaves the ``atomic_task`` bucket pristine, and
+            # no private internals are touched.
             for limiter in limiters:
-                limiter._get_client()
+                limiter.can_consume('atomic_warmup', '50/s')
 
             def worker(limiter):
                 ok, _ = limiter.can_consume('atomic_task', '50/s')

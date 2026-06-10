@@ -92,31 +92,58 @@ class test_global_rate_limit:
 
     @flaky
     def test_window_resets_and_refills_over_time(self, redis_backend_url):
-        """Draining the bucket denies further calls until the window refills."""
+        """Draining the bucket denies further calls until the window refills.
+
+        Timing note: this is a live-Redis test of *time-based* refill, so it is
+        inherently real-time dependent.  To keep it robust (and not rely on one
+        fixed ``sleep`` landing exactly on a refill boundary) it uses BOUNDED
+        loops with explicit deadlines rather than a single timed sleep+assert:
+        it drains until the first observed denial, then polls for the refill
+        within a generous deadline.  At ``5/s`` a token accrues roughly every
+        0.2s, so both events occur well inside the deadlines below; ``@flaky``
+        remains as a safety net for CI scheduling jitter.
+        """
         task_name = 't.integration.rate_limiting.window_reset'
         rate = '5/s'
         get_redis_connection().delete(f'celery:global_rate_limit:{task_name}')
 
         limiter = RedisRateLimiter(backend_url=redis_backend_url)
 
+        # Drain the shared bucket until a denial is observed.  Looping until the
+        # first denial -- rather than assuming a fixed call count drains it --
+        # keeps the drain deterministic no matter how much the bucket refilled
+        # between calls (consume calls are far faster than the 5/s refill, so a
+        # denial appears within a few attempts; 200 is a generous safety bound).
         granted = 0
-        for _ in range(20):
-            allowed, _retry_after = limiter.can_consume(task_name, rate)
+        denied_retry = None
+        for _ in range(200):
+            allowed, retry_after = limiter.can_consume(task_name, rate)
             if allowed:
                 granted += 1
-        # A full bucket grants at least one token before being drained.
+            else:
+                denied_retry = retry_after
+                break
+        # A full bucket grants at least one token before being drained...
         assert granted >= 1
+        # ...and once drained the limiter denies with a positive wait time.
+        assert denied_retry is not None
+        assert denied_retry > 0
 
-        # Bucket now drained -> the next call is denied with a positive wait.
-        allowed, retry_after = limiter.can_consume(task_name, rate)
-        assert allowed is False
-        assert retry_after > 0
-
-        # After ~1s the window refills (TTL-based reset) -> allowed again.
-        time.sleep(1.1)
-        allowed, retry_after = limiter.can_consume(task_name, rate)
-        assert allowed is True
-        assert retry_after == 0.0
+        # The drained window refills over time (the Lua script accrues tokens at
+        # `rate`/sec and PEXPIRE resets the key).  Poll within a bounded deadline
+        # instead of a single fixed sleep: a grant must reappear, and when it
+        # does it reports no wait.  This removes the timing sensitivity the
+        # single ``sleep(1.1)`` had while still proving time-based refill.
+        deadline = time.monotonic() + 5.0
+        refilled = False
+        while time.monotonic() < deadline:
+            allowed, retry_after = limiter.can_consume(task_name, rate)
+            if allowed:
+                assert retry_after == 0.0
+                refilled = True
+                break
+            time.sleep(0.1)
+        assert refilled, 'bucket did not refill within the deadline'
 
     def test_unset_or_zero_rate_is_noop(self, redis_backend_url):
         """``None``/``0``/``"0/s"`` are no-ops returning ``(True, 0.0)``."""

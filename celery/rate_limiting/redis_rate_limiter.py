@@ -19,8 +19,12 @@ provided optionally through the ``kombu[redis]`` extra -- so it is imported
 lazily under a guard that mirrors :mod:`celery.backends.redis`.  When the client
 library is missing, the configured backend URL is unreachable, or the Lua
 evaluation fails for any reason, :meth:`RedisRateLimiter.can_consume` logs a
-single sanitized warning and returns ``(True, 0.0)``, signalling the caller to
-fall back to Celery's existing per-process behaviour rather than raising.
+single sanitized warning and raises
+:exc:`~celery.rate_limiting.base.RateLimiterUnavailable`, signalling the caller
+to fall back to Celery's existing per-process behaviour.  Raising (rather than
+returning ``(True, 0.0)``) is what keeps a backend outage distinguishable from a
+genuine cluster-wide grant, so the worker preserves per-process limiting instead
+of silently dispatching unlimited tasks while Redis is down.
 
 Reused, never re-implemented:
 
@@ -36,7 +40,7 @@ import time
 
 from kombu.utils.url import maybe_sanitize_url
 
-from celery.rate_limiting.base import BaseRateLimiter
+from celery.rate_limiting.base import BaseRateLimiter, RateLimiterUnavailable
 from celery.utils.log import get_logger
 from celery.utils.time import rate as rate_to_tps  # parses "10/s"/"100/m"/"1000/h" -> tokens/sec
 
@@ -164,11 +168,16 @@ class RedisRateLimiter(BaseRateLimiter):
     ``EVAL``, the decision is atomic across every worker process in the cluster
     and the configured ``rate_limit`` becomes a true aggregate ceiling.
 
-    The limiter is intentionally **fail-open**: it never raises out of
-    :meth:`can_consume`.  If ``redis-py`` is not installed, the backend URL
-    cannot be reached, or the Lua evaluation errors, the limiter logs exactly
-    one sanitized warning per instance and returns ``(True, 0.0)`` so the
-    worker silently falls back to Celery's existing per-process rate limiting.
+    The limiter is intentionally **fail-safe**: it never lets a backend problem
+    crash the worker.  If ``redis-py`` is not installed, the backend URL cannot
+    be reached, or the Lua evaluation errors, the limiter logs exactly one
+    sanitized warning per instance and raises
+    :exc:`~celery.rate_limiting.base.RateLimiterUnavailable` so the worker falls
+    back to Celery's existing per-process rate limiting.  Raising a dedicated
+    exception -- rather than returning ``(True, 0.0)`` as a real grant would --
+    is what lets :mod:`celery.worker.strategy` tell a backend outage apart from
+    a genuine cluster-wide grant and keep the per-process bucket intact on
+    fallback.
 
     Arguments:
         backend_url (str): The Redis connection URL the limiter coordinates
@@ -303,21 +312,37 @@ class RedisRateLimiter(BaseRateLimiter):
             ``True`` when a token was consumed and the task may run now (with
             ``retry_after`` ``0.0``); otherwise ``allowed`` is ``False`` and
             ``retry_after`` is the number of seconds to wait before re-queueing.
-            On any failure (missing client or Redis error) the limiter fails
-            open, returning ``(True, 0.0)`` so the caller uses the per-process
-            path.  This method never raises.
+            An unset or zero rate is a no-op and returns ``(True, 0.0)`` without
+            touching Redis (it does **not** raise).
+
+        Raises:
+            RateLimiterUnavailable: When the backend cannot enforce the limit --
+                ``redis-py`` is missing, the pool/client cannot be built, the
+                rate string is malformed, or the Lua ``EVAL`` errors.  The
+                limiter logs a single sanitized warning per instance first, then
+                raises so the caller falls back to per-process rate limiting.
+                Raising (instead of returning ``(True, 0.0)``) keeps a backend
+                outage distinguishable from a genuine grant; see
+                :class:`~celery.rate_limiting.base.RateLimiterUnavailable`.  No
+                other exception ever escapes this method.
         """
         # Reuse Celery's existing parser; it returns tokens-per-second and
         # yields 0 for None/empty/zero rates (and accepts plain numbers too).
         # A malformed rate string (e.g. 'bad' -> ValueError, '10/x' -> KeyError)
-        # makes the parser raise; honour the documented "never raises / fails
-        # open" contract by warning once and falling back rather than letting
-        # the exception escape into the worker's dispatch path.
+        # makes the parser raise; honour the documented fallback contract by
+        # warning once and signalling fallback (raise RateLimiterUnavailable)
+        # rather than letting the parse error escape into the dispatch path.
         try:
             tps = rate_to_tps(rate)
         except Exception as exc:
+            # The rate string is malformed, so the limiter cannot enforce a
+            # cluster-wide ceiling: warn once and signal fallback to the
+            # per-process path rather than let the parse error escape into the
+            # worker's dispatch path.  Raising (vs returning a grant) keeps this
+            # distinct from a real grant so the per-process bucket is preserved.
             self._warn_fallback(exc)
-            return (True, 0.0)
+            raise RateLimiterUnavailable(
+                f'invalid rate {rate!r} for task {task_name!r}') from exc
         if not tps:
             # An unset or zero rate means the global limiter is not consulted;
             # do not touch Redis at all -- this is a pure no-op.
@@ -326,9 +351,12 @@ class RedisRateLimiter(BaseRateLimiter):
         client = self._get_client()
         if client is None:
             # redis-py missing or the pool/client failed to build: warn once
-            # and fall back to the existing per-process limiter.
+            # and signal fallback so the caller uses the existing per-process
+            # limiter.  Raising (vs returning a grant) keeps this distinct from
+            # a real Redis-enforced grant so the per-process bucket is preserved.
             self._warn_fallback()
-            return (True, 0.0)
+            raise RateLimiterUnavailable(
+                f'redis client unavailable for task {task_name!r}')
 
         # Capacity = one second's worth of tokens preserves the aggregate
         # ceiling, while max(1.0, tps) guarantees a single task is never
@@ -355,8 +383,12 @@ class RedisRateLimiter(BaseRateLimiter):
             retry_after = float(retry_raw)
             return (allowed, retry_after if not allowed else 0.0)
         except Exception as exc:
-            # Fail open, never crash the worker.
+            # Never crash the worker on a backend problem.
             # Covers redis.exceptions.RedisError, ConnectionError, timeouts and
-            # any Lua/runtime error: warn once and fall back gracefully.
+            # any Lua/runtime error: warn once and signal fallback so the caller
+            # degrades to the per-process limiter.  Raising (vs returning a
+            # grant) keeps this distinct from a real grant so the per-process
+            # bucket is preserved during a Redis outage.
             self._warn_fallback(exc)
-            return (True, 0.0)
+            raise RateLimiterUnavailable(
+                f'redis evaluation failed for task {task_name!r}') from exc

@@ -18,7 +18,38 @@ from __future__ import annotations
 
 import abc
 
-__all__ = ('BaseRateLimiter',)
+__all__ = ('BaseRateLimiter', 'RateLimiterUnavailable')
+
+
+class RateLimiterUnavailable(Exception):
+    """Signal that a limiter cannot make a cluster-wide decision right now.
+
+    A concrete :class:`BaseRateLimiter` raises this from
+    :meth:`BaseRateLimiter.can_consume` when its shared backend is
+    unavailable -- for example the backend client library is not installed,
+    the configured backend cannot be reached, or the atomic evaluation errors.
+    It instructs the worker dispatch strategy (:mod:`celery.worker.strategy`)
+    to **fall back to Celery's existing per-process rate limiting** for this
+    task instead of treating the call as a granted cluster-wide token.
+
+    Raising is deliberate and is the contract's third, distinct outcome:
+
+    * an *enforced grant* returns ``(True, 0.0)``,
+    * an *enforced denial* returns ``(False, retry_after)``, and
+    * an *unavailable backend* raises :class:`RateLimiterUnavailable`.
+
+    Distinguishing fallback from a real grant is essential to correctness.  If
+    a backend failure were reported as ``(True, 0.0)`` it would be
+    indistinguishable from a genuine grant, and the strategy -- which bypasses
+    the per-process bucket on a grant so a consumed token is not double
+    counted -- would bypass per-process limiting during a backend outage,
+    silently removing *all* rate limiting.  Raising instead lets the strategy
+    leave the per-process bucket intact and degrade gracefully.
+
+    A no-op rate (an unset or zero ``rate_limit``) is **not** an unavailable
+    backend: implementations treat it as always-allowed and return
+    ``(True, 0.0)`` without raising.
+    """
 
 
 class BaseRateLimiter(metaclass=abc.ABCMeta):
@@ -57,9 +88,18 @@ class BaseRateLimiter(metaclass=abc.ABCMeta):
             is ``True`` if a token was consumed and the task may run now, and
             ``retry_after`` is the number of seconds the caller should wait
             before re-queueing the task when denied.  ``retry_after`` is
-            ``0.0`` whenever ``allowed`` is ``True``.
+            ``0.0`` whenever ``allowed`` is ``True``.  An unset/zero rate is a
+            no-op and **must** return ``(True, 0.0)`` without consulting the
+            backend.
 
         Raises:
+            RateLimiterUnavailable: Concrete subclasses **must** raise this
+                (rather than return a decision) when their shared backend is
+                unavailable, to instruct the caller to fall back to the
+                existing per-process rate limiting for this task.  An
+                enforced grant or denial is returned as a value; only an
+                unavailable backend raises.  See :class:`RateLimiterUnavailable`
+                for why fallback must be distinguishable from a real grant.
             NotImplementedError: Always, in the abstract base class.  Concrete
                 subclasses override this method with a real implementation.
         """
