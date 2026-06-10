@@ -6,6 +6,7 @@ from kombu.asynchronous.timer import to_timestamp
 from celery import signals
 from celery.app import trace as _app_trace
 from celery.exceptions import InvalidTaskError
+from celery.rate_limiting import get_global_rate_limiter  # global (cluster-wide) rate limiter hook
 from celery.utils.imports import symbol_by_name
 from celery.utils.log import get_logger
 from celery.utils.saferepr import saferepr
@@ -123,6 +124,13 @@ def default(task, app, consumer,
     handle = consumer.on_task_request
     limit_task = consumer._limit_task
     limit_post_eta = consumer._limit_post_eta
+    # Optional global (cluster-wide) rate limiter; None when the feature is disabled (default).
+    # Memoized on the consumer (mirrors how per-process buckets live on consumer.task_buckets);
+    # this does NOT modify consumer.py.
+    global_rate_limiter = getattr(consumer, 'global_rate_limiter', None)
+    if global_rate_limiter is None:
+        global_rate_limiter = get_global_rate_limiter(app)
+        setattr(consumer, 'global_rate_limiter', global_rate_limiter)
     Request = symbol_by_name(task.Request)
     Req = create_request_cls(Request, task, consumer.pool, hostname, eventer,
                              app=app)
@@ -202,6 +210,31 @@ def default(task, app, consumer,
         if bucket:
             return limit_task(req, bucket, 1)
 
+        # --- Optional global (cluster-wide) rate-limit hook (additive, opt-in, default-off). ---
+        # Consulted only when the feature is enabled (limiter is not None) AND the task declares
+        # a rate_limit. On allow -> fall through to the unchanged dispatch path. On deny -> re-queue
+        # WITH DELAY via the consumer timer (never drop), mirroring the per-process delayed-requeue
+        # path (limit_post_eta / consumer._schedule_bucket_request). On error -> warn once and fall
+        # through to the unchanged per-process path (never crash the worker).
+        if global_rate_limiter is not None and task.rate_limit:
+            try:
+                allowed, retry_after = global_rate_limiter.can_consume(
+                    task.name, task.rate_limit)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning(
+                    'Global rate limiter error for %r: %r; '
+                    'falling back to per-process rate limiting',
+                    task.name, exc)
+            else:
+                if not allowed:
+                    # Deny: re-queue with a computed delay (retry_after seconds) using the
+                    # consumer timer, mirroring the ETA dispatch path at L198-200. apply_eta_task
+                    # performs task_reserved + on_task_request + qos.decrement_eventually(), which
+                    # balances the increment_eventually() below.
+                    consumer.qos.increment_eventually()
+                    return consumer.timer.call_after(
+                        retry_after, apply_eta_task, (req,), priority=6)
+        # --- end global rate-limit hook ---
         task_reserved(req)
         if callbacks:
             [callback(req) for callback in callbacks]
