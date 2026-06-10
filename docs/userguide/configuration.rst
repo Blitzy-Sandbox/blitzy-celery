@@ -3596,6 +3596,41 @@ Default: Disabled (rate limits enabled).
 
 Disable all rate limits, even if tasks has explicit rate limits set.
 
+.. setting:: worker_global_rate_limit
+
+``worker_global_rate_limit``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: Disabled.
+
+When enabled, a task's configured :attr:`~celery.app.task.Task.rate_limit`
+is enforced as a single aggregate limit across the *entire worker pool*
+(all worker processes and nodes), instead of independently within each
+worker process as is the default. For example, a task limited to ``10/s``
+running on 10 workers is held to ``10/s`` pool-wide rather than up to
+``100/s``.
+
+This option is **opt-in**: when it is disabled (the default) the existing
+per-worker rate limiting behavior is unchanged. Enabling it requires
+:setting:`worker_global_rate_limit_url` to be set and the ``celery[redis]``
+bundle to be installed (``pip install "celery[redis]"``).
+
+The shared token-bucket state is keyed per task name in Redis, so distinct
+tasks keep independent global limits. If Redis is unreachable, the limiter
+gracefully falls back to local per-worker rate limiting so workers keep
+running.
+
+.. setting:: worker_global_rate_limit_url
+
+``worker_global_rate_limit_url``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: :const:`None`.
+
+The Redis connection URL (for example ``redis://localhost:6379/0``,
+consumed via ``redis.from_url``) holding the shared token-bucket state used
+when :setting:`worker_global_rate_limit` is enabled.
+
 .. setting:: worker_state_db
 
 ``worker_state_db``
