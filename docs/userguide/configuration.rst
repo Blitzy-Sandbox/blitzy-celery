@@ -3596,6 +3596,65 @@ Default: Disabled (rate limits enabled).
 
 Disable all rate limits, even if tasks has explicit rate limits set.
 
+.. setting:: worker_rate_limits_global
+
+``worker_rate_limits_global``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 5.7
+
+Default: Disabled (rate limits are enforced per worker).
+
+When enabled (set to :const:`True`), a task's ``rate_limit`` becomes a *global*
+(cluster-wide) aggregate ceiling that is shared across **all** workers, instead
+of being enforced independently by each worker. The limit is coordinated
+through Redis, so for example ten workers configured for ``"10/s"`` admit
+about 10 tasks per second in aggregate rather than about 10 per second *each*.
+
+When disabled (the default), rate limiting is byte-for-byte identical to the
+local, per-worker token-bucket behavior: no new imports are executed and no
+Redis connection is opened.
+
+Using the global rate limiter requires the redis extra
+(``pip install "celery[redis]"``) and a reachable Redis server. The
+coordinating Redis is named by the :setting:`worker_rate_limit_url` setting.
+
+If the limiter cannot reach Redis (a connection or timeout error) it *fails
+open*: it logs a warning and degrades to per-worker rate limiting rather than
+halting task consumption. This is a deliberate availability-over-strictness
+trade-off.
+
+.. seealso::
+
+    The :setting:`worker_rate_limit_url` setting names the coordinating Redis
+    server, :setting:`worker_disable_rate_limits` can disable all rate limits,
+    and :setting:`task_default_rate_limit` sets a default rate limit for tasks.
+
+.. setting:: worker_rate_limit_url
+
+``worker_rate_limit_url``
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 5.7
+
+Default: :const:`None`.
+
+Names the Redis URL used to coordinate the global rate limiter (see
+:setting:`worker_rate_limits_global`).
+
+When :const:`None` (the default), the URL is resolved from
+:setting:`result_backend`, then :setting:`broker_url`, whenever either of those
+uses a Redis scheme.
+
+The supported schemes are ``redis://``, ``rediss://`` (TLS) and
+``redis+socket://`` (Unix socket).
+
+Using the global rate limiter requires the redis extra
+(``pip install "celery[redis]"``). If :setting:`worker_rate_limits_global` is
+enabled but the redis library is not installed, an
+:exc:`~celery.exceptions.ImproperlyConfigured` error is raised (mirroring the
+Redis result backend's guard).
+
 .. setting:: worker_state_db
 
 ``worker_state_db``
