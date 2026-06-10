@@ -1052,9 +1052,11 @@ General
     (``pip install "celery[redis]"``) and a reachable Redis server.
 
     Runtime rate-limit changes also take effect cluster-wide, because the
-    bucket state lives in Redis keyed by task name. For example, calling
-    ``app.control.rate_limit("tasks.send_sms", "5/m")`` now applies across the
-    whole cluster.
+    bucket state lives in Redis under a key namespaced by both the application
+    name and the task name (``celery:rate_limit:{app}:{task_name}``), so two
+    separate apps that share one Redis never collide on a bucket. For example,
+    calling ``app.control.rate_limit("tasks.send_sms", "5/m")`` now applies
+    across the whole cluster.
 
     If the limiter cannot reach Redis it *fails open*: it logs a warning and
     degrades to per-worker rate limiting rather than halting task consumption —

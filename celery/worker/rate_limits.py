@@ -30,7 +30,7 @@ try:
 except ImportError:
     redis = None
 
-__all__ = ('RedisTokenBucket', 'get_limiter_client')
+__all__ = ('RedisTokenBucket', 'get_limiter_client', 'rate_limit_key')
 
 logger = get_logger(__name__)
 
@@ -120,6 +120,38 @@ return {allowed, wait_ms}
 """
 
 
+#: Redis key prefix for every per-task global rate-limit bucket hash.  The full
+#: key built by :func:`rate_limit_key` is
+#: ``celery:rate_limit:{app.main or 'celery'}:{task_name}``, so the app name
+#: always namespaces the bucket.
+KEY_PREFIX = 'celery:rate_limit'
+
+
+def rate_limit_key(app, task_name):
+    """Build the app-namespaced Redis key for a task's rate-limit bucket.
+
+    This is the single, canonical key builder for the global rate limiter; the
+    consumer integration must route every :class:`RedisTokenBucket` through it
+    so the key scheme stays consistent across workers and so that two Celery
+    apps which share one Redis -- and happen to register a task of the same
+    name -- never collide on a single global bucket.
+
+    The returned key is ``celery:rate_limit:{app.main or 'celery'}:{task_name}``.
+    The app segment falls back to ``'celery'`` when :attr:`app.main` is unset,
+    giving an unnamed app a stable namespace of its own rather than an empty one.
+
+    Arguments:
+        app (Celery): The Celery application owning the task; its
+            :attr:`~celery.Celery.main` name namespaces the key.
+        task_name (str): The registered task name (for example
+            ``"tasks.send_sms"``).
+
+    Returns:
+        str: The fully-qualified Redis key for this task's bucket hash.
+    """
+    return f'{KEY_PREFIX}:{app.main or "celery"}:{task_name}'
+
+
 class RedisTokenBucket(TokenBucket):
     """Token bucket whose admission decision is coordinated through Redis.
 
@@ -142,7 +174,10 @@ class RedisTokenBucket(TokenBucket):
             caller, which only builds a bucket for a non-zero rate limit).
         capacity (float): Maximum number of tokens held by the bucket.
         client (redis.Redis): Redis client used to coordinate the bucket.
-        key (str): Fully-qualified Redis key for this task's bucket hash.
+        key (str): Fully-qualified Redis key for this task's bucket hash, as
+            built by :func:`rate_limit_key` -- the canonical, app-namespaced
+            key builder the consumer integration must use so that two apps
+            sharing one Redis never collide on a single bucket.
     """
 
     def __init__(self, fill_rate, capacity=1, *, client=None, key=None):
