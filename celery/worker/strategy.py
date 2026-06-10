@@ -131,6 +131,35 @@ def default(task, app, consumer,
     if global_rate_limiter is None:
         global_rate_limiter = get_global_rate_limiter(app)
         setattr(consumer, 'global_rate_limiter', global_rate_limiter)
+
+    # Optional global rate-limiter delayed-dispatch helper (used only when the
+    # feature is enabled). Scheduled on the consumer timer for tasks gated by
+    # the global limiter -- both ETA tasks (consulted at their ETA) and tasks
+    # previously denied -- it RE-CHECKS the limiter on every wake, mirroring the
+    # per-process consumer._schedule_bucket_request recheck, so workers that woke
+    # after the same delay cannot all dispatch and exceed the cluster-wide
+    # ceiling. On a fresh allow it dispatches via the existing
+    # consumer.apply_eta_task (task_reserved + on_task_request +
+    # qos.decrement_eventually, balancing the qos.increment_eventually() made
+    # when the task was first delayed); on a repeat denial it reschedules with
+    # the new retry_after and no additional increment. Does NOT modify consumer.py.
+    def _global_dispatch_or_retry(req):
+        try:
+            allowed, retry_after = global_rate_limiter.can_consume(
+                task.name, task.rate_limit)
+        except Exception as exc:  # pylint: disable=broad-except
+            # The limiter is contracted never to raise; if it ever does, fail
+            # open and dispatch now rather than loop or crash the worker.
+            logger.warning(
+                'Global rate limiter error for %r: %r; dispatching task',
+                task.name, exc)
+            allowed = True
+        if allowed:
+            apply_eta_task(req)
+        else:
+            consumer.timer.call_after(
+                retry_after, _global_dispatch_or_retry, (req,), priority=6)
+
     Request = symbol_by_name(task.Request)
     Req = create_request_cls(Request, task, consumer.pool, hostname, eventer,
                              app=app)
@@ -198,6 +227,50 @@ def default(task, app, consumer,
         if rate_limits_enabled:
             bucket = get_bucket(task.name)
 
+        # --- Optional global (cluster-wide) rate-limit gate (additive, opt-in, default-off). ---
+        # Consulted BEFORE the per-process bucket/ETA decisions below, but only when the feature is
+        # enabled (limiter is not None) AND the task declares a rate_limit. When engaged, the
+        # cluster-wide limiter is the authoritative gate for this task: it REPLACES the per-process
+        # bucket (so a granted global token is never wasted by a second limiter) while still honoring
+        # any ETA. On allow -> clear `bucket` and fall through to the unchanged direct-dispatch path.
+        # On deny -> re-queue WITH DELAY via the consumer timer and RE-CHECK Redis on every wake
+        # (mirrors consumer._schedule_bucket_request); never drop the task. If the limiter raises (it
+        # is contracted never to) -> warn once and fall through to the unchanged per-process path.
+        # Disabled (the default) -> this block is skipped entirely and behavior is byte-for-byte
+        # identical. Does NOT modify consumer.py.
+        if global_rate_limiter is not None and task.rate_limit:
+            if eta:
+                # Defer consultation to ETA time so the aggregate token is consumed when the task
+                # actually dispatches; schedule the recheck helper instead of apply_eta_task.
+                # increment_eventually() mirrors the ETA path below and is balanced by the decrement
+                # inside _global_dispatch_or_retry on eventual dispatch.
+                consumer.qos.increment_eventually()
+                return call_at(eta, _global_dispatch_or_retry, (req,), priority=6)
+            try:
+                allowed, retry_after = global_rate_limiter.can_consume(
+                    task.name, task.rate_limit)
+            except Exception as exc:  # pylint: disable=broad-except
+                # Never crash the worker: warn and fall through to the unchanged per-process path
+                # (the eta/bucket/direct branches below run with `bucket` unchanged).
+                logger.warning(
+                    'Global rate limiter error for %r: %r; '
+                    'falling back to per-process rate limiting',
+                    task.name, exc)
+            else:
+                if allowed:
+                    # Granted (or failed open): dispatch now, bypassing the per-process bucket so the
+                    # consumed global token is not wasted by a second limiter. Clearing `bucket` makes
+                    # the branches below fall through to the unchanged direct-dispatch path.
+                    bucket = None
+                else:
+                    # Denied by the cluster-wide limiter: re-queue WITH DELAY (never drop) and recheck
+                    # Redis on wake via the helper. increment_eventually() is balanced by the decrement
+                    # inside _global_dispatch_or_retry on eventual dispatch.
+                    consumer.qos.increment_eventually()
+                    return consumer.timer.call_after(
+                        retry_after, _global_dispatch_or_retry, (req,), priority=6)
+        # --- end global rate-limit gate ---
+
         if eta and bucket:
             consumer.qos.increment_eventually()
             return call_at(eta, limit_post_eta, (req, bucket, 1),
@@ -210,31 +283,6 @@ def default(task, app, consumer,
         if bucket:
             return limit_task(req, bucket, 1)
 
-        # --- Optional global (cluster-wide) rate-limit hook (additive, opt-in, default-off). ---
-        # Consulted only when the feature is enabled (limiter is not None) AND the task declares
-        # a rate_limit. On allow -> fall through to the unchanged dispatch path. On deny -> re-queue
-        # WITH DELAY via the consumer timer (never drop), mirroring the per-process delayed-requeue
-        # path (limit_post_eta / consumer._schedule_bucket_request). On error -> warn once and fall
-        # through to the unchanged per-process path (never crash the worker).
-        if global_rate_limiter is not None and task.rate_limit:
-            try:
-                allowed, retry_after = global_rate_limiter.can_consume(
-                    task.name, task.rate_limit)
-            except Exception as exc:  # pylint: disable=broad-except
-                logger.warning(
-                    'Global rate limiter error for %r: %r; '
-                    'falling back to per-process rate limiting',
-                    task.name, exc)
-            else:
-                if not allowed:
-                    # Deny: re-queue with a computed delay (retry_after seconds) using the
-                    # consumer timer, mirroring the ETA dispatch path at L198-200. apply_eta_task
-                    # performs task_reserved + on_task_request + qos.decrement_eventually(), which
-                    # balances the increment_eventually() below.
-                    consumer.qos.increment_eventually()
-                    return consumer.timer.call_after(
-                        retry_after, apply_eta_task, (req,), priority=6)
-        # --- end global rate-limit hook ---
         task_reserved(req)
         if callbacks:
             [callback(req) for callback in callbacks]

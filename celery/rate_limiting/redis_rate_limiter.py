@@ -54,6 +54,20 @@ __all__ = ('RedisRateLimiter',)
 #: result-backend or broker keys, and are trivial to inspect or flush.
 KEY_PREFIX = 'celery:global_rate_limit:'
 
+#: Default Redis socket timeouts (in seconds) for the limiter's connection pool.
+#:
+#: The limiter sits on the worker's hot task-dispatch path, so it must *fail
+#: open promptly* when Redis is unreachable rather than block for the OS-level
+#: TCP timeout (which can be tens of seconds).  These deliberately short
+#: defaults bound how long a blackholed/unreachable endpoint can stall dispatch
+#: before :meth:`RedisRateLimiter.can_consume` catches the connection/timeout
+#: error and falls back to the per-process limiter.  They are tunable per
+#: instance via the constructor and are overridden by any
+#: ``socket_connect_timeout`` / ``socket_timeout`` query parameter embedded in
+#: the backend URL (redis-py resolves URL querystring args ahead of kwargs).
+DEFAULT_SOCKET_CONNECT_TIMEOUT = 0.2
+DEFAULT_SOCKET_TIMEOUT = 0.2
+
 #: Atomic token-bucket refill-and-consume implemented as a single Lua script.
 #:
 #: Evaluating the whole read-modify-write inside Redis (one ``EVAL``) makes the
@@ -167,9 +181,21 @@ class RedisRateLimiter(BaseRateLimiter):
             burst, in tokens) to use for every task.  When ``None`` (the
             default) the capacity is derived per task from its rate at call
             time -- see :meth:`can_consume`.
+        socket_connect_timeout (float, optional): Seconds to wait when opening
+            the TCP connection to Redis before failing open.  Defaults to
+            :data:`DEFAULT_SOCKET_CONNECT_TIMEOUT` so an unreachable endpoint
+            never stalls task dispatch for the OS-level TCP timeout.  A
+            ``socket_connect_timeout`` query parameter in ``backend_url``
+            overrides this value.
+        socket_timeout (float, optional): Seconds to wait for a Redis reply
+            (the Lua ``EVAL``/``EVALSHA`` round-trip) before failing open.
+            Defaults to :data:`DEFAULT_SOCKET_TIMEOUT`.  A ``socket_timeout``
+            query parameter in ``backend_url`` overrides this value.
     """
 
-    def __init__(self, backend_url, capacity=None, default_capacity=None):
+    def __init__(self, backend_url, capacity=None, default_capacity=None,
+                 socket_connect_timeout=DEFAULT_SOCKET_CONNECT_TIMEOUT,
+                 socket_timeout=DEFAULT_SOCKET_TIMEOUT):
         # Keep the raw URL for building the client, but only ever log/store a
         # sanitized copy so embedded credentials are never written to logs.
         self._url = backend_url
@@ -182,6 +208,12 @@ class RedisRateLimiter(BaseRateLimiter):
         self._default_capacity = (
             default_capacity if default_capacity is not None else capacity
         )
+        # Sane, short socket timeouts so an unreachable Redis fails open
+        # promptly instead of blocking dispatch for the OS-level TCP timeout.
+        # Passed to ConnectionPool.from_url; any timeout embedded in the URL
+        # query string takes precedence (redis-py resolves URL args first).
+        self._socket_connect_timeout = socket_connect_timeout
+        self._socket_timeout = socket_timeout
         # Lazily-built client/script and a one-shot guard so the fallback
         # warning is logged at most once per limiter instance (no log flooding
         # under high task volume).  No connection is opened in __init__ so
@@ -214,8 +246,16 @@ class RedisRateLimiter(BaseRateLimiter):
             if self._client is None:
                 # ConnectionPool.from_url does not open a socket, so building
                 # it here is cheap; pooling amortises connection setup across
-                # the high volume of can_consume calls.
-                pool = redis.ConnectionPool.from_url(self._url)
+                # the high volume of can_consume calls.  The socket timeouts
+                # bound every connect and reply (including the Lua EVAL/EVALSHA
+                # round-trip) so an unreachable Redis fails open promptly rather
+                # than blocking dispatch; a timeout supplied in the URL query
+                # string overrides these defaults (redis-py: URL args win).
+                pool = redis.ConnectionPool.from_url(
+                    self._url,
+                    socket_connect_timeout=self._socket_connect_timeout,
+                    socket_timeout=self._socket_timeout,
+                )
                 self._client = redis.Redis(connection_pool=pool)
                 # Register the script once; subsequent calls reuse the cached
                 # SHA via EVALSHA, keeping each consume to a single round-trip.
@@ -269,7 +309,15 @@ class RedisRateLimiter(BaseRateLimiter):
         """
         # Reuse Celery's existing parser; it returns tokens-per-second and
         # yields 0 for None/empty/zero rates (and accepts plain numbers too).
-        tps = rate_to_tps(rate)
+        # A malformed rate string (e.g. 'bad' -> ValueError, '10/x' -> KeyError)
+        # makes the parser raise; honour the documented "never raises / fails
+        # open" contract by warning once and falling back rather than letting
+        # the exception escape into the worker's dispatch path.
+        try:
+            tps = rate_to_tps(rate)
+        except Exception as exc:
+            self._warn_fallback(exc)
+            return (True, 0.0)
         if not tps:
             # An unset or zero rate means the global limiter is not consulted;
             # do not touch Redis at all -- this is a pure no-op.
