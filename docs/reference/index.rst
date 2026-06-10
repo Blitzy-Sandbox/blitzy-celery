@@ -59,6 +59,9 @@
     celery.worker.request
     celery.worker.state
     celery.worker.strategy
+    celery.rate_limiting
+    celery.rate_limiting.base
+    celery.rate_limiting.redis_rate_limiter
     celery.worker.consumer
     celery.worker.consumer.agent
     celery.worker.consumer.connection

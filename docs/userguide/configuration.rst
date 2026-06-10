@@ -734,6 +734,59 @@ This value is used for tasks that doesn't have a custom rate limit
     The :setting:`worker_disable_rate_limits` setting can
     disable all rate limits.
 
+.. setting:: global_rate_limit_enabled
+
+``global_rate_limit_enabled``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: Disabled.
+
+Enables the Redis-backed, cluster-wide (global) rate limiter.
+
+When disabled (the default), task rate limits are enforced per worker
+process exactly as before. When enabled, any task that declares a
+``rate_limit`` has that rate enforced as an aggregate ceiling across all
+worker processes in the cluster, coordinated through the Redis server
+configured by :setting:`global_rate_limit_backend_url`. If the Redis
+server is unreachable or the Redis client library is not installed, the
+worker logs a warning and falls back to per-process rate limiting.
+
+.. seealso::
+
+    :setting:`global_rate_limit_backend_url` for the Redis URL used by
+    the global limiter, and :setting:`task_default_rate_limit` and
+    :setting:`worker_disable_rate_limits` for the existing per-process
+    rate-limit controls.
+
+.. setting:: global_rate_limit_backend_url
+
+``global_rate_limit_backend_url``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: :const:`None`.
+
+The URL of the Redis server used by the global rate limiter, for
+example ``redis://localhost:6379/0``. The URL may embed credentials.
+
+This setting has no effect unless :setting:`global_rate_limit_enabled`
+is turned on.
+
+The limiter uses a bounded Redis connection pool (default ceiling of
+100 connections) so a burst of highly-concurrent task dispatch cannot
+open an unbounded number of sockets. The pool size can be tuned per
+deployment by appending a ``max_connections`` query parameter to the
+URL, for example ``redis://localhost:6379/0?max_connections=50``;
+size it to the worker concurrency for very high single-process
+concurrency (for instance large ``gevent``/``eventlet`` pools). The
+short socket connect/read timeouts that make an unreachable Redis fail
+open promptly may likewise be tuned via ``socket_connect_timeout`` and
+``socket_timeout`` query parameters.
+
+.. seealso::
+
+    :setting:`global_rate_limit_enabled` to turn the global rate limiter
+    on.
+
 .. _conf-result-backend:
 
 Task result backend settings

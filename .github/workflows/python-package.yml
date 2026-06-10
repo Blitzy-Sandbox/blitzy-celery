@@ -99,6 +99,9 @@ jobs:
           'test_canvas.py',
           'test_connection_recovery.py',
           'test_database_backend.py',
+          # Register the global rate limiter integration module (lives under
+          # t/integration/rate_limiting/) so it runs in CI; collected via -k.
+          'test_global_rate_limit.py',
           'test_inspect.py',
           'test_loader.py',
           'test_mem_leak_in_exception_handling.py',

@@ -6,6 +6,8 @@ from kombu.asynchronous.timer import to_timestamp
 from celery import signals
 from celery.app import trace as _app_trace
 from celery.exceptions import InvalidTaskError
+from celery.rate_limiting import RateLimiterUnavailable  # global (cluster-wide) rate limiter hook
+from celery.rate_limiting import get_global_rate_limiter
 from celery.utils.imports import symbol_by_name
 from celery.utils.log import get_logger
 from celery.utils.saferepr import saferepr
@@ -123,6 +125,51 @@ def default(task, app, consumer,
     handle = consumer.on_task_request
     limit_task = consumer._limit_task
     limit_post_eta = consumer._limit_post_eta
+    # Optional global (cluster-wide) rate limiter; None when the feature is disabled (default).
+    # Memoized on the consumer (mirrors how per-process buckets live on consumer.task_buckets);
+    # this does NOT modify consumer.py.
+    global_rate_limiter = getattr(consumer, 'global_rate_limiter', None)
+    if global_rate_limiter is None:
+        global_rate_limiter = get_global_rate_limiter(app)
+        setattr(consumer, 'global_rate_limiter', global_rate_limiter)
+
+    # Optional global rate-limiter delayed-dispatch helper (used only when the
+    # feature is enabled). Scheduled on the consumer timer for tasks gated by
+    # the global limiter -- both ETA tasks (consulted at their ETA) and tasks
+    # previously denied -- it RE-CHECKS the limiter on every wake, mirroring the
+    # per-process consumer._schedule_bucket_request recheck, so workers that woke
+    # after the same delay cannot all dispatch and exceed the cluster-wide
+    # ceiling. On a fresh allow it dispatches via the existing
+    # consumer.apply_eta_task (task_reserved + on_task_request +
+    # qos.decrement_eventually, balancing the qos.increment_eventually() made
+    # when the task was first delayed); on a repeat denial it reschedules with
+    # the new retry_after and no additional increment. Does NOT modify consumer.py.
+    def _global_dispatch_or_retry(req):
+        try:
+            allowed, retry_after = global_rate_limiter.can_consume(
+                task.name, task.rate_limit)
+        except RateLimiterUnavailable:
+            # The backend went unavailable while this already-accepted task was
+            # waiting in the global-limiter delayed-dispatch flow (the limiter
+            # already logged one sanitized warning). The task was admitted past
+            # the global gate and its qos slot incremented, so dispatch it now
+            # (apply_eta_task balances that slot) rather than re-queue forever
+            # while Redis is down -- never drop the task.
+            allowed = True
+        except Exception as exc:  # pylint: disable=broad-except
+            # Defensive: the limiter signals fallback only via
+            # RateLimiterUnavailable, but never loop or crash the worker on an
+            # unexpected error -- dispatch now (fail safe, no task loss).
+            logger.warning(
+                'Global rate limiter error for %r: %r; dispatching task',
+                task.name, exc)
+            allowed = True
+        if allowed:
+            apply_eta_task(req)
+        else:
+            consumer.timer.call_after(
+                retry_after, _global_dispatch_or_retry, (req,), priority=6)
+
     Request = symbol_by_name(task.Request)
     Req = create_request_cls(Request, task, consumer.pool, hostname, eventer,
                              app=app)
@@ -189,6 +236,67 @@ def default(task, app, consumer,
                 req.reject(requeue=False)
         if rate_limits_enabled:
             bucket = get_bucket(task.name)
+
+        # --- Optional global (cluster-wide) rate-limit gate (additive, opt-in, default-off). ---
+        # Consulted BEFORE the per-process bucket/ETA decisions below, but only when the feature is
+        # enabled (limiter is not None) AND the task declares a rate_limit. When engaged the limiter
+        # has THREE distinct, mutually-exclusive outcomes that map to three behaviors:
+        #   * CONFIRMED GRANT     -> can_consume() returns (True, _): a cluster-wide token was actually
+        #       consumed in Redis, so we clear `bucket` to bypass the per-process limiter (the global
+        #       token must not be double-counted) and fall through to the direct-dispatch path.
+        #   * CONFIRMED DENIAL    -> can_consume() returns (False, retry_after): re-queue WITH DELAY
+        #       via the consumer timer and RE-CHECK Redis on every wake (mirrors
+        #       consumer._schedule_bucket_request); never drop the task.
+        #   * BACKEND UNAVAILABLE -> can_consume() raises RateLimiterUnavailable (redis-py missing,
+        #       Redis unreachable, or the Lua EVAL errored; the limiter already logged one sanitized
+        #       warning): FALL BACK to Celery's existing per-process limiter by leaving `bucket`
+        #       UNCHANGED, so the per-process branch below runs exactly as if the global limiter were
+        #       disabled. This is the AAP-required graceful fallback -- a Redis outage must degrade to
+        #       per-process limiting, NEVER bypass all rate limiting. Distinguishing this case from a
+        #       real grant is precisely why the limiter raises here instead of returning (True, 0.0).
+        # Disabled (the default) -> this whole block is skipped and behavior is byte-for-byte
+        # identical. Does NOT modify consumer.py.
+        if global_rate_limiter is not None and task.rate_limit:
+            if eta:
+                # Defer consultation to ETA time so the aggregate token is consumed when the task
+                # actually dispatches; schedule the recheck helper instead of apply_eta_task.
+                # increment_eventually() mirrors the ETA path below and is balanced by the decrement
+                # inside _global_dispatch_or_retry on eventual dispatch.
+                consumer.qos.increment_eventually()
+                return call_at(eta, _global_dispatch_or_retry, (req,), priority=6)
+            try:
+                allowed, retry_after = global_rate_limiter.can_consume(
+                    task.name, task.rate_limit)
+            except RateLimiterUnavailable:
+                # BACKEND UNAVAILABLE: fall back to per-process rate limiting. The limiter already
+                # logged a single sanitized warning, so we deliberately do NOT warn again here (that
+                # would flood the log once per task). Leaving `bucket` UNCHANGED makes the per-process
+                # branch below execute exactly as if the global limiter were disabled. This is the
+                # graceful fallback the AAP requires on a missing/unreachable Redis backend.
+                pass
+            except Exception as exc:  # pylint: disable=broad-except
+                # Defensive: the limiter signals fallback only via RateLimiterUnavailable, but never
+                # crash the worker on an unexpected error -- warn and fall back to the per-process
+                # path (the eta/bucket/direct branches below run with `bucket` unchanged).
+                logger.warning(
+                    'Global rate limiter error for %r: %r; '
+                    'falling back to per-process rate limiting',
+                    task.name, exc)
+            else:
+                if allowed:
+                    # CONFIRMED Redis-enforced grant: a cluster-wide token was consumed, so bypass the
+                    # per-process bucket (clear it) to avoid double-counting and fall through to the
+                    # direct-dispatch path. Only a real grant reaches here -- a backend outage raises
+                    # RateLimiterUnavailable and is handled above with `bucket` left intact.
+                    bucket = None
+                else:
+                    # CONFIRMED denial by the cluster-wide limiter: re-queue WITH DELAY (never drop)
+                    # and recheck Redis on wake via the helper. increment_eventually() is balanced by
+                    # the decrement inside _global_dispatch_or_retry on eventual dispatch.
+                    consumer.qos.increment_eventually()
+                    return consumer.timer.call_after(
+                        retry_after, _global_dispatch_or_retry, (req,), priority=6)
+        # --- end global rate-limit gate ---
 
         if eta and bucket:
             consumer.qos.increment_eventually()
