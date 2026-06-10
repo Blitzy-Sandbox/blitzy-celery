@@ -237,6 +237,30 @@ def test_redis_token_bucket_is_cluster_wide(app, celery_worker_pool):
         assert two_count < single_count * 1.6, (
             f'two-worker count {two_count} ~= 2x single-worker {single_count}: '
             f'rate limit is NOT cluster-wide')
+
+        # 5) Throughput is actually CLOSE TO the limit, not near zero.  The
+        #    upper bounds above are satisfied even by a broken limiter that
+        #    admits only a handful of tasks across the window, so a generous
+        #    lower bound (>= half the configured rate) on BOTH measurements is
+        #    what proves throughput ~= limit rather than merely "not above it".
+        assert single_rate >= RATE_PER_SECOND * 0.5, (
+            f'single-worker rate {single_rate:.2f}/s is far below ~limit '
+            f'(count={single_count}, elapsed={single_elapsed:.2f}s): the '
+            f'limiter is under-admitting, not enforcing ~{RATE_PER_SECOND}/s')
+        assert two_rate >= RATE_PER_SECOND * 0.5, (
+            f'two-worker aggregate rate {two_rate:.2f}/s is far below ~limit '
+            f'(count={two_count}, elapsed={two_elapsed:.2f}s): the limiter is '
+            f'under-admitting, not enforcing ~{RATE_PER_SECOND}/s')
+
+        # 6) Two-sided ratio band: the two-worker count must be neither ~2x the
+        #    single-worker baseline (per-worker failure mode, bounded above by
+        #    check 4) nor drastically lower (an over-throttling/broken limiter).
+        #    Combined with check 4 this pins two_count / single_count into
+        #    [0.6, 1.6) -- i.e. ~1, the signature of one shared global bucket.
+        assert two_count >= single_count * 0.6, (
+            f'two-worker count {two_count} is far below single-worker '
+            f'{single_count} (ratio {two_count / single_count:.2f} < 0.6): the '
+            f'global bucket appears to be over-throttling across two workers')
     finally:
         # Restore global state so the session-scoped fixtures and other tests
         # are unaffected, and leave Redis clean for back-to-back re-runs.
