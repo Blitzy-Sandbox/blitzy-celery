@@ -10,6 +10,7 @@ moto>=4.1.11,<5.1.0
 # type checking
 mypy==1.19.1; platform_python_implementation=="CPython"
 pre-commit>=4.0.1; python_version >= '3.9'
+fakeredis[lua]>=2.35.1
 -r extras/yaml.txt
 -r extras/msgpack.txt
 -r extras/mongodb.txt
