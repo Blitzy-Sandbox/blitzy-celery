@@ -296,9 +296,9 @@ class Consumer:
     def bucket_for_task(self, type):
         limit = rate(getattr(type, 'rate_limit', None))
         if limit and self.app.conf.worker_rate_limits_global:
-            from celery.worker.rate_limits import RedisTokenBucket, get_limiter_client
+            from celery.worker.rate_limits import RedisTokenBucket, get_limiter_client, rate_limit_key
             client = get_limiter_client(self.app)
-            key = f"celery:rate_limit:{self.app.main or 'celery'}:{type.name}"
+            key = rate_limit_key(self.app, type.name)
             return RedisTokenBucket(limit, capacity=1, client=client, key=key)
         return TokenBucket(limit, capacity=1) if limit else None
 

@@ -199,7 +199,12 @@ class RedisTokenBucket(TokenBucket):
         # Fail-open state: the local shadow bucket is built lazily and reused
         # so it keeps its per-worker token state across Redis outages.
         self._local_bucket = None
-        self._last_warning = 0.0
+        # ``None`` means "no fail-open warning has been emitted yet".  The first
+        # Redis failure must always log before throttling begins; a numeric
+        # sentinel such as ``0.0`` would silently suppress that first warning on
+        # a freshly started worker whose ``monotonic()`` value is still below
+        # ``WARN_THROTTLE`` (its reference point is unspecified).
+        self._last_warning = None
 
     def can_consume(self, tokens=1):
         """Atomically attempt to consume ``tokens`` from the shared bucket.
@@ -250,10 +255,14 @@ class RedisTokenBucket(TokenBucket):
         return self._local_bucket
 
     def _warn_fail_open(self, exc):
-        # Throttle warnings to at most one per ``WARN_THROTTLE`` seconds per
-        # bucket so a persistent outage does not flood the log.
+        # Always log the *first* fail-open for this bucket, then throttle to at
+        # most one warning per ``WARN_THROTTLE`` seconds so a persistent outage
+        # does not flood the log.  Testing ``_last_warning is None`` first
+        # guarantees the first Redis failure is reported even on a freshly
+        # started worker whose ``monotonic()`` value is still below
+        # ``WARN_THROTTLE`` (the monotonic reference point is unspecified).
         now = monotonic()
-        if now - self._last_warning >= WARN_THROTTLE:
+        if self._last_warning is None or now - self._last_warning >= WARN_THROTTLE:
             self._last_warning = now
             # SECURITY: reference only the task name (parsed from the key) and
             # the exception class name -- never the URL or any credentials.

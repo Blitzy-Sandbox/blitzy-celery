@@ -12,6 +12,7 @@ genuine ``redis`` exception class (the fail-open path) guards itself with
 ``pytest.importorskip('redis')`` so it skips gracefully when redis-py is not
 installed, mirroring :mod:`t.unit.backends.test_redis`.
 """
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -19,7 +20,38 @@ from kombu.utils.limits import TokenBucket
 
 from celery.exceptions import ImproperlyConfigured
 from celery.worker import rate_limits
-from celery.worker.rate_limits import RedisTokenBucket, get_limiter_client
+from celery.worker.rate_limits import RedisTokenBucket, get_limiter_client, rate_limit_key
+
+
+class test_rate_limit_key:
+    """Coverage for the canonical app-namespaced Redis key builder.
+
+    ``rate_limit_key`` is the single source of truth for the global rate
+    limiter key scheme; the consumer integration builds every bucket key
+    through it, so both the ``app.main`` and the fallback-to-``'celery'``
+    branches must be locked down by tests to prevent key-scheme drift.
+    """
+
+    def test_uses_app_main_when_set(self):
+        # A named app namespaces the key with ``app.main`` so two apps sharing
+        # one Redis never collide on a single global bucket.
+        app = SimpleNamespace(main='myapp')
+        assert (rate_limit_key(app, 'tasks.send_sms')
+                == 'celery:rate_limit:myapp:tasks.send_sms')
+
+    def test_falls_back_to_celery_when_app_main_unset(self):
+        # An unnamed app (``app.main`` is None/empty) gets the stable
+        # ``'celery'`` namespace rather than an empty segment.
+        assert (rate_limit_key(SimpleNamespace(main=None), 'tasks.foo')
+                == 'celery:rate_limit:celery:tasks.foo')
+        assert (rate_limit_key(SimpleNamespace(main=''), 'tasks.foo')
+                == 'celery:rate_limit:celery:tasks.foo')
+
+    def test_key_is_prefixed_and_four_segments(self):
+        # Documented shape: ``celery:rate_limit:{app}:{task_name}``.
+        key = rate_limit_key(SimpleNamespace(main='myapp'), 'tasks.bar')
+        assert key.startswith(rate_limits.KEY_PREFIX + ':')
+        assert len(key.split(':')) == 4
 
 
 class test_RedisTokenBucket:
@@ -94,6 +126,24 @@ class test_RedisTokenBucket:
         assert RedisTokenBucket.pop is TokenBucket.pop
         assert RedisTokenBucket.clear_pending is TokenBucket.clear_pending
 
+    def test_only_can_consume_and_expected_time_are_overridden(self):
+        # Minimal-change contract (AAP Rule 2 "subclass, do not abstract"):
+        # ONLY the token-decision methods may be overridden; the deque-based
+        # request-queue protocol must be inherited verbatim from kombu.
+        #
+        # The two admission methods are genuinely overridden (defined on the
+        # subclass and differing from the superclass implementation)...
+        assert 'can_consume' in RedisTokenBucket.__dict__
+        assert 'expected_time' in RedisTokenBucket.__dict__
+        assert RedisTokenBucket.can_consume is not TokenBucket.can_consume
+        assert RedisTokenBucket.expected_time is not TokenBucket.expected_time
+        # ...while the queue protocol is NOT redefined on the subclass (so it
+        # is inherited unchanged, keeping ``_schedule_bucket_request`` working).
+        assert 'add' not in RedisTokenBucket.__dict__
+        assert 'pop' not in RedisTokenBucket.__dict__
+        assert 'contents' not in RedisTokenBucket.__dict__
+        assert 'clear_pending' not in RedisTokenBucket.__dict__
+
     def test_inherited_deque_queue_still_works(self):
         bucket, _ = self._make_bucket(10.0)
         bucket.add(('req', 1))
@@ -158,6 +208,38 @@ class test_RedisTokenBucket:
             # shadow may have drained its single token by now).
             bucket.can_consume(1)
             assert mock_logger.warning.call_count == 1
+
+    def test_first_fail_open_warning_logs_even_at_low_monotonic(self):
+        # Regression for the R5 first-warning suppression bug: ``monotonic()``
+        # has an *unspecified* reference point, so a freshly started worker can
+        # observe a value well below ``WARN_THROTTLE`` (60s).  The first Redis
+        # failure MUST still emit a warning -- a 0.0-initialised throttle
+        # timestamp would have silently swallowed it for the whole first
+        # minute of process life.
+        redis = pytest.importorskip('redis')
+        bucket, _ = self._make_bucket(
+            10.0, key='celery:rate_limit:celery:tasks.send_sms')
+        bucket._script.side_effect = redis.exceptions.ConnectionError('boom')
+
+        # Drive ``monotonic`` to small, below-threshold values: the first two
+        # decisions land inside one WARN_THROTTLE window (1.0 -> 1.5), the
+        # third lands after the window has elapsed (-> 70.0).
+        with patch('celery.worker.rate_limits.monotonic',
+                   side_effect=[1.0, 1.5, 70.0]):
+            with patch('celery.worker.rate_limits.logger') as mock_logger:
+                # First failure at monotonic()==1.0 (< WARN_THROTTLE) must log.
+                bucket.can_consume(1)
+                assert mock_logger.warning.call_count == 1
+
+                # Second failure at 1.5 is within the throttle window (0.5s
+                # later) and is suppressed.
+                bucket.can_consume(1)
+                assert mock_logger.warning.call_count == 1
+
+                # Third failure at 70.0 is >= WARN_THROTTLE after the first
+                # warning, so a fresh warning is emitted.
+                bucket.can_consume(1)
+                assert mock_logger.warning.call_count == 2
 
 
 class test_get_limiter_client:
