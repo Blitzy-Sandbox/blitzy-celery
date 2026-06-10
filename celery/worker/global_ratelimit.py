@@ -164,6 +164,15 @@ class GlobalTokenBucket(TokenBucket):
         # Cached wait (seconds) from the most recent ``can_consume`` so
         # ``expected_time`` can answer without a second Redis round-trip.
         self._wait = 0.0
+        # Whether the most recent ``can_consume`` decision came from the local
+        # fallback path (Redis absent/unconfigured, or a Redis error raised at
+        # call time).  When True, ``expected_time`` must use the inherited local
+        # token-bucket math instead of the cached Redis ``_wait`` -- otherwise a
+        # Redis outage would surface a stale wait (for example ``0.0``) and
+        # busy-loop the worker's reschedule timer.  Initialised True so that a
+        # never-consumed bucket reports inherited local timing until a real
+        # Redis decision is recorded.
+        self._used_local_fallback = True
         # Build the client once.  An injected client wins (testability);
         # otherwise build it from the URL when redis-py is installed.  Any
         # failure here (for example a malformed URL) degrades to local limiting
@@ -171,9 +180,15 @@ class GlobalTokenBucket(TokenBucket):
         if client is not None:
             self._client = client
         elif redis is not None and redis_url:
+            # Narrow the construction guard to the *expected* setup failures so
+            # a genuine programming error is never silently swallowed: a
+            # malformed URL raises ``ValueError`` and a misconfigured/unreachable
+            # server raises a redis-py error (``_REDIS_ERRORS``).  Both degrade
+            # to local limiting; any other exception is a real defect and is
+            # allowed to propagate.
             try:
                 self._client = redis.from_url(redis_url)
-            except Exception:  # pragma: no cover - bad URL -> local fallback
+            except (ValueError, *_REDIS_ERRORS):
                 self._client = None
         else:
             self._client = None
@@ -181,9 +196,14 @@ class GlobalTokenBucket(TokenBucket):
         # EVALSHA and transparently falls back to EVAL if the script is
         # evicted, so no bespoke script caching is required.
         if self._client is not None:
+            # Only a Redis error here should degrade to local limiting; a
+            # non-Redis error (for example an invalid injected client) is a real
+            # defect and must surface rather than be hidden.  ``register_script``
+            # merely computes the script's SHA, so in practice this rarely
+            # raises.
             try:
                 self._script = self._client.register_script(LUA_TOKEN_BUCKET)
-            except Exception:  # pragma: no cover - degrade to local limiting
+            except _REDIS_ERRORS:
                 self._script = None
         else:
             self._script = None
@@ -199,7 +219,9 @@ class GlobalTokenBucket(TokenBucket):
         local token-bucket behaviour so the worker keeps functioning.
         """
         if self._script is None:
-            # No Redis configured/available: use the local per-worker bucket.
+            # No Redis configured/available: use the local per-worker bucket and
+            # mark the decision local so ``expected_time`` uses local timing.
+            self._used_local_fallback = True
             return super().can_consume(tokens)
         try:
             allowed, wait_ms = self._script(
@@ -208,19 +230,29 @@ class GlobalTokenBucket(TokenBucket):
             )
             # Lua returns integer milliseconds; recover fractional seconds.
             self._wait = float(wait_ms) / 1000.0
+            # Redis answered: ``expected_time`` may use the cached wait.
+            self._used_local_fallback = False
             return bool(allowed)
         except _REDIS_ERRORS:
-            # Redis is DOWN: degrade to local limiting, never propagate.
+            # Redis is DOWN: degrade to local limiting, never propagate.  Mark
+            # the decision local so the paired ``expected_time`` call returns the
+            # inherited local wait (not the stale cached Redis ``_wait``), which
+            # prevents an immediate-reschedule busy-loop during the outage.
+            self._used_local_fallback = True
             return super().can_consume(tokens)
 
     def expected_time(self, tokens=1):
         """Return seconds to wait before ``tokens`` can be consumed.
 
         In the worker's scheduling loop this is called immediately after a
-        failing :meth:`can_consume`, so it returns the wait cached by that call
-        and avoids a second Redis round-trip.  Falls back to the inherited
-        local estimate when no Redis client is configured.
+        failing :meth:`can_consume`, so when Redis answered that call it simply
+        returns the wait cached then and avoids a second Redis round-trip.  It
+        falls back to the inherited local estimate when no Redis client is
+        configured *or* when the preceding :meth:`can_consume` degraded to the
+        local bucket because Redis was down -- keeping the consume decision and
+        the reported wait consistent and preventing a stale (for example
+        ``0.0``) wait from busy-looping the worker's reschedule timer.
         """
-        if self._script is None:
+        if self._script is None or self._used_local_fallback:
             return super().expected_time(tokens)
         return self._wait
