@@ -372,6 +372,11 @@ NAMESPACES = Namespace(
         timer_precision=Option(1.0, type='float'),
         detect_quorum_queues=Option(True, type='bool'),
     ),
+    # Global (cluster-wide) Redis-backed rate limiter feature settings (ADD-ONLY).
+    global_rate_limit=Namespace(
+        enabled=Option(False, type='bool', old={'celery_global_rate_limit_enabled'}),
+        backend_url=Option(None, type='string', old={'celery_global_rate_limit_backend_url'}),
+    ),
 )
 
 
