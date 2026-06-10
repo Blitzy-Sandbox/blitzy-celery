@@ -35,6 +35,11 @@ from celery.worker import loops
 from celery.worker.state import (active_requests, maybe_shutdown, requests, reserved_requests, successful_requests,
                                  task_reserved)
 
+# Opt-in global (Redis-backed) rate-limiter bucket used by bucket_for_task() below;
+# pinned out of isort's alphabetical order (isort:skip) so this single feature import
+# stays grouped after the worker-state wiring, per the minimal-change requirement.
+from celery.rate_limiting.redis_rate_limiter import RedisTokenBucket  # isort:skip
+
 __all__ = ('Consumer', 'Evloop', 'dump_body')
 
 CLOSE = bootsteps.CLOSE
@@ -295,6 +300,17 @@ class Consumer:
 
     def bucket_for_task(self, type):
         limit = rate(getattr(type, 'rate_limit', None))
+        # Global (Redis-backed) rate limiting is opt-in: when
+        # task_global_rate_limit_backend is configured, enforce the existing
+        # rate_limit across the whole worker fleet via RedisTokenBucket;
+        # otherwise fall back to the per-worker TokenBucket (unchanged default).
+        if limit and self.app.conf.task_global_rate_limit_backend:
+            return RedisTokenBucket(
+                limit, capacity=1,
+                backend_url=self.app.conf.task_global_rate_limit_backend,
+                task_name=type.name,
+                fail_open=self.app.conf.task_global_rate_limit_fail_open,
+            )
         return TokenBucket(limit, capacity=1) if limit else None
 
     def reset_rate_limits(self):

@@ -1029,10 +1029,14 @@ General
     Default is the :setting:`task_default_rate_limit` setting:
     if not specified means rate limiting for tasks is disabled by default.
 
-    Note that this is a *per worker instance* rate limit, and not a global
-    rate limit. To enforce a global rate limit (e.g., for an API with a
-    maximum number of  requests per second), you must restrict to a given
-    queue.
+    Note that, by default, this is a *per worker instance* rate limit, and not
+    a global rate limit: with *N* worker processes the configured rate can be
+    exceeded by up to a factor of *N*. To enforce a global rate limit across
+    the entire worker fleet (e.g., for an API with a maximum number of requests
+    per second), set the :setting:`task_global_rate_limit_backend` setting to a
+    Redis URL; the configured rate limit is then coordinated globally using
+    Redis. Alternatively, you can restrict the task to a dedicated queue served
+    by a single worker.
 
 .. attribute:: Task.time_limit
 

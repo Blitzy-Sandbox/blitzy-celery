@@ -734,6 +734,49 @@ This value is used for tasks that doesn't have a custom rate limit
     The :setting:`worker_disable_rate_limits` setting can
     disable all rate limits.
 
+.. setting:: task_global_rate_limit_backend
+
+``task_global_rate_limit_backend``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: No global rate limiter (per-worker rate limiting; same as today).
+
+This setting is *opt-in*. When set to a Redis URL (for example
+``redis://localhost:6379/0``), a task's existing
+:attr:`~celery.app.task.Task.rate_limit` is enforced *globally across the
+entire worker fleet* using Redis as shared coordination state, rather than
+independently within each worker process. When unset (the default), rate
+limiting uses the existing per-worker token bucket and behavior is unchanged.
+
+Also available under its legacy name ``CELERY_GLOBAL_RATE_LIMIT_BACKEND``.
+
+Enabling the global limiter requires the ``celery[redis]`` extra (already
+installed when using Redis as a broker or result backend). The limiter opens
+its own independent Redis connection from the configured URL; it does not
+reuse the broker or :setting:`result_backend` connection.
+
+.. seealso::
+
+    :setting:`task_default_rate_limit`, the
+    :attr:`~celery.app.task.Task.rate_limit` task attribute, and
+    :setting:`task_global_rate_limit_fail_open`.
+
+.. setting:: task_global_rate_limit_fail_open
+
+``task_global_rate_limit_fail_open``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``True`` (fail-open).
+
+Controls graceful degradation when the Redis coordination backend configured
+via :setting:`task_global_rate_limit_backend` is *unreachable*. With the
+default ``True`` (*fail-open*), tasks are allowed to run so that a
+coordination-layer outage never halts task processing. Set it to ``False``
+(*fail-closed*) to block tasks while Redis is unavailable. This setting only
+takes effect when :setting:`task_global_rate_limit_backend` is configured.
+
+Also available under its legacy name ``CELERY_GLOBAL_RATE_LIMIT_FAIL_OPEN``.
+
 .. _conf-result-backend:
 
 Task result backend settings
