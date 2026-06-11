@@ -110,3 +110,100 @@ def test_concurrent_consume_no_over_admission(redis_url):
     # burst is negligible; an atomic script admits exactly ``capacity``.
     assert admitted >= 1
     assert admitted <= capacity + 1
+
+
+def test_local_fallback_when_no_redis_url():
+    # Graceful degradation, construction half: when neither an injected client
+    # nor a usable URL is configured (the "redis-py absent / unconfigured"
+    # case), the bucket must build no client/script and transparently use the
+    # inherited local TokenBucket math.  This is a REAL construction path --
+    # Redis is neither mocked nor patched; there simply is no Redis to talk to.
+    fill_rate = rate('1/s')  # slow refill so the second consume is denied
+    key = f'grl:{uuid4().hex}'
+    bucket = GlobalTokenBucket(
+        fill_rate, capacity=1, redis_url='', key=key, client=None)
+
+    # No client and no script were built -> every call takes the local path.
+    assert bucket._client is None
+    assert bucket._script is None
+    # Local fallback math: a fresh, full bucket admits exactly one token, then
+    # is empty until it refills (which takes ~1s at 1/s, far longer than this
+    # test), so the second call is denied -- proving real local enforcement.
+    assert bucket.can_consume(1) is True
+    assert bucket.can_consume(1) is False
+    # expected_time delegates to the inherited local estimate (a float).
+    wait = bucket.expected_time(1)
+    assert isinstance(wait, float)
+    assert wait >= 0.0
+
+
+def test_local_fallback_when_redis_url_malformed():
+    # Graceful degradation, construction half: a malformed URL makes the real
+    # ``redis.from_url`` raise ``ValueError`` while building the client.  The
+    # bucket must catch that, leave itself client/script-less, and degrade to
+    # local limiting instead of letting construction raise.  This exercises a
+    # genuine ``redis.from_url`` call (not a mock/patch) with a bad URL.
+    if redis is None:
+        pytest.skip('redis-py is not installed')
+    fill_rate = rate('1/s')
+    key = f'grl:{uuid4().hex}'
+    bucket = GlobalTokenBucket(
+        fill_rate, capacity=1,
+        redis_url='redis://localhost:notaport/0', key=key, client=None)
+
+    # Construction swallowed the URL error and fell back to local limiting.
+    assert bucket._client is None
+    assert bucket._script is None
+    assert bucket.can_consume(1) is True
+
+
+def test_local_fallback_when_register_script_fails():
+    # Graceful degradation, construction half: even when a client is present,
+    # if registering the Lua script fails with a redis error the bucket must
+    # degrade to local limiting rather than raise.  ``register_script`` only
+    # computes a SHA locally, so a healthy client never hits this guard; we
+    # therefore drive it with a REAL ``redis.Redis`` subclass whose
+    # ``register_script`` raises.  This is NOT a Redis mock -- it is a genuine
+    # ``redis.Redis`` instance and the Redis server is never faked; only the
+    # local SHA-registration step is forced to fail to reach the defensive
+    # fallback branch.
+    if redis is None:
+        pytest.skip('redis-py is not installed')
+
+    class _RegisterScriptFails(redis.Redis):
+        def register_script(self, script):
+            raise redis.exceptions.RedisError('register_script failed')
+
+    fill_rate = rate('1/s')
+    key = f'grl:{uuid4().hex}'
+    bucket = GlobalTokenBucket(
+        fill_rate, capacity=1, redis_url='redis://localhost:6390/0',
+        key=key, client=_RegisterScriptFails())
+
+    # The client was accepted, but script registration failed -> no script ->
+    # the bucket uses the inherited local math instead of raising.
+    assert bucket._client is not None
+    assert bucket._script is None
+    assert bucket.can_consume(1) is True
+
+
+@pytest.mark.timeout(30)
+def test_expected_time_returns_cached_redis_wait(redis_url):
+    # When Redis actually answers a (denied) ``can_consume``, ``expected_time``
+    # must return the wait Redis computed -- the value cached on the bucket --
+    # WITHOUT a second round-trip and WITHOUT falling back to local timing.
+    # Uses the REAL container so the wait is produced by the atomic Lua script.
+    fill_rate = rate('1/s')  # slow refill so the second consume is denied
+    key = f'grl:{uuid4().hex}'
+    bucket = GlobalTokenBucket(
+        fill_rate, capacity=1, redis_url=redis_url, key=key)
+    # Redis is configured and reachable, so a script was registered.
+    assert bucket._script is not None
+
+    assert bucket.can_consume(1) is True   # consumes the only token
+    assert bucket.can_consume(1) is False  # denied -> Redis returns a wait
+    # Redis answered the deny, so this was NOT a local fallback decision ...
+    assert bucket._used_local_fallback is False
+    assert bucket._wait > 0.0
+    # ... and expected_time returns exactly that cached, Redis-provided wait.
+    assert bucket.expected_time(1) == bucket._wait
