@@ -337,6 +337,13 @@ NAMESPACES = Namespace(
         disable_rate_limits=Option(
             False, type='bool', old={'celery_disable_rate_limits'},
         ),
+        # Global (cross-worker) rate limiting — opt-in, Redis-backed.
+        # When ``worker_global_rate_limit`` is True and a Redis URL is set via
+        # ``worker_global_rate_limit_url``, a task's rate_limit is enforced as a
+        # single aggregate ceiling across the whole worker pool instead of
+        # per-worker-process. Defaults preserve the existing per-worker behavior.
+        global_rate_limit=Option(False, type='bool'),
+        global_rate_limit_url=Option(None, type='string'),
         deduplicate_successful_tasks=Option(
             False, type='bool'
         ),

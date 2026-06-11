@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, Mock, call, patch
 import pytest
 from amqp import ChannelError
 from billiard.exceptions import RestartFreqExceeded
+from kombu.utils.limits import TokenBucket
 
 from celery import bootsteps
 from celery.contrib.testing.mocks import ContextMock
@@ -20,6 +21,7 @@ from celery.worker.consumer.gossip import Gossip
 from celery.worker.consumer.heart import Heart
 from celery.worker.consumer.mingle import Mingle
 from celery.worker.consumer.tasks import Tasks
+from celery.worker.global_ratelimit import GlobalTokenBucket
 from celery.worker.state import active_requests, successful_requests
 
 
@@ -58,6 +60,43 @@ class test_Consumer(ConsumerTestCase):
     def test_taskbuckets_defaultdict(self):
         c = self.get_consumer()
         assert c.task_buckets['fooxasdwx.wewe'] is None
+
+    def test_bucket_for_task_global_when_enabled(self):
+        # The global (Redis-backed) limiter is opt-in: it is selected only when
+        # BOTH worker_global_rate_limit is truthy AND a url is configured.
+        c = self.get_consumer()
+        conf = self.app.conf
+        previous_flag = conf.worker_global_rate_limit
+        previous_url = conf.worker_global_rate_limit_url
+        self.add.rate_limit = '10/s'
+        try:
+            # Disabled (the default): the plain per-process TokenBucket is used.
+            conf.worker_global_rate_limit = False
+            bucket = c.bucket_for_task(self.add)
+            assert isinstance(bucket, TokenBucket)
+            assert not isinstance(bucket, GlobalTokenBucket)
+
+            # Enabled needs the flag AND a url; redis.from_url() is lazy, so no
+            # live server is required for the selection itself.
+            conf.worker_global_rate_limit = True
+            conf.worker_global_rate_limit_url = 'redis://localhost:6379/0'
+            assert isinstance(c.bucket_for_task(self.add), GlobalTokenBucket)
+
+            # The flag without a url falls back to the default TokenBucket.
+            conf.worker_global_rate_limit_url = None
+            bucket = c.bucket_for_task(self.add)
+            assert isinstance(bucket, TokenBucket)
+            assert not isinstance(bucket, GlobalTokenBucket)
+
+            # A task with no rate limit yields None even when enabled.
+            conf.worker_global_rate_limit_url = 'redis://localhost:6379/0'
+            self.add.rate_limit = None
+            assert c.bucket_for_task(self.add) is None
+        finally:
+            # Never leak the new config onto the shared session-scoped app.
+            conf.worker_global_rate_limit = previous_flag
+            conf.worker_global_rate_limit_url = previous_url
+            self.add.rate_limit = None
 
     def test_sets_heartbeat(self):
         c = self.get_consumer(amqheartbeat=10)

@@ -1034,6 +1034,10 @@ General
     maximum number of  requests per second), you must restrict to a given
     queue.
 
+    Alternatively, you can enforce a single pool-wide (global) rate limit
+    across all worker processes by enabling the
+    :setting:`worker_global_rate_limit` setting (Redis-backed).
+
 .. attribute:: Task.time_limit
 
     The hard time limit, in seconds, for this task.
