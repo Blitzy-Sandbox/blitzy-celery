@@ -17,7 +17,7 @@ from uuid import uuid4
 import pytest
 
 from celery.utils.time import rate
-from celery.worker.global_ratelimit import GlobalTokenBucket
+from celery.worker.global_ratelimit import DEFAULT_SOCKET_TIMEOUT, GlobalTokenBucket
 
 try:
     import redis
@@ -207,3 +207,71 @@ def test_expected_time_returns_cached_redis_wait(redis_url):
     assert bucket._wait > 0.0
     # ... and expected_time returns exactly that cached, Redis-provided wait.
     assert bucket.expected_time(1) == bucket._wait
+
+
+def test_default_socket_timeout_injected_on_url_built_client():
+    # Bounded-degradation guard: a client built from a URL that omits any
+    # timeout must still carry a *finite* default socket_connect_timeout and
+    # socket_timeout, so an unreachable Redis fails fast instead of hanging the
+    # admission hot path on the OS TCP connect timeout (~127s).  A real redis-py
+    # client is constructed (no mock); the URL is never connected to here --
+    # only the resolved connection kwargs are inspected.
+    if redis is None:
+        pytest.skip('redis-py is not installed')
+    key = f'grl:{uuid4().hex}'
+    bucket = GlobalTokenBucket(
+        rate('10/s'), capacity=1,
+        redis_url='redis://localhost:6390/0', key=key)
+    assert bucket._client is not None
+    kwargs = bucket._client.get_connection_kwargs()
+    assert kwargs['socket_connect_timeout'] == DEFAULT_SOCKET_TIMEOUT
+    assert kwargs['socket_timeout'] == DEFAULT_SOCKET_TIMEOUT
+
+
+def test_url_socket_timeout_query_param_overrides_default():
+    # Operator control is preserved with no new user-facing setting: a
+    # socket_connect_timeout supplied in the Redis URL query string overrides
+    # the injected default, so deployments can tune the bound.  Real
+    # redis.from_url -- nothing is mocked or patched.
+    if redis is None:
+        pytest.skip('redis-py is not installed')
+    key = f'grl:{uuid4().hex}'
+    bucket = GlobalTokenBucket(
+        rate('10/s'), capacity=1,
+        redis_url='redis://localhost:6390/0?socket_connect_timeout=5',
+        key=key)
+    assert bucket._client is not None
+    kwargs = bucket._client.get_connection_kwargs()
+    # The operator-supplied value wins over DEFAULT_SOCKET_TIMEOUT.
+    assert kwargs['socket_connect_timeout'] == 5.0
+
+
+@pytest.mark.timeout(30)
+def test_redis_down_fallback_latency_is_bounded():
+    # The MAJOR-finding regression guard.  Under a black-hole / unreachable
+    # Redis (RFC 5737 TEST-NET-1 192.0.2.1 is guaranteed unroutable) reached via
+    # the realistic default URL that carries NO timeout query param, a single
+    # can_consume must NOT block on the OS TCP connect timeout (~127s): the
+    # injected default socket_connect_timeout bounds the connect so the bucket
+    # degrades to the local decision quickly.  This drives a REAL socket against
+    # a real unroutable address -- Redis is neither mocked nor patched.
+    if redis is None:
+        pytest.skip('redis-py is not installed')
+    key = f'grl:{uuid4().hex}'
+    bucket = GlobalTokenBucket(
+        rate('10/s'), capacity=1,
+        redis_url='redis://192.0.2.1:6390/0', key=key)
+
+    start = time.monotonic()
+    allowed = bucket.can_consume(1)
+    elapsed = time.monotonic() - start
+
+    # Bounded far below the unpatched ~127s OS default.  The generous ceiling
+    # tolerates CI/network variance yet still fails if the timeout is missing
+    # (the bug regressing).  An immediately-unreachable network only returns
+    # *faster*, so this never false-fails.
+    assert elapsed < 10.0
+    # The call degraded to the inherited local bucket (a fresh, full bucket
+    # admits the first token) and recorded the decision as a local fallback.
+    assert allowed is True
+    assert bucket._used_local_fallback is True

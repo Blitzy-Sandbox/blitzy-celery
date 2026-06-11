@@ -33,6 +33,22 @@ except ImportError:  # pragma: no cover
 __all__ = ('GlobalTokenBucket',)
 
 
+# Default socket timeouts (seconds) applied when building the per-bucket Redis
+# client from a URL.  ``socket_connect_timeout`` bounds the TCP connect phase
+# and ``socket_timeout`` bounds every read/write.  Without them, a black-hole /
+# unreachable Redis (cloud failover, network partition, firewall drop) would
+# make every ``can_consume`` admission call block on the OS TCP connect timeout
+# (~127s on Linux) before the graceful-fallback ``except`` fires -- freezing the
+# worker's admission hot path during an outage instead of degrading quickly.
+# A small default keeps the Redis-down fallback fast/bounded; the healthy hot
+# path is sub-millisecond so this ceiling is never hit in normal operation.
+# Operators who need a different bound can override it through the
+# ``worker_global_rate_limit_url`` query string (for example
+# ``redis://host:6379/0?socket_connect_timeout=5``), which takes precedence over
+# this default -- so no extra user-facing setting is introduced.
+DEFAULT_SOCKET_TIMEOUT = 2.0
+
+
 # -- Atomic token-bucket Lua script ------------------------------------------
 # Executed server-side by Redis (via EVALSHA, with automatic EVAL fallback) so
 # the whole refill -> check -> consume -> write cycle is a single atomic
@@ -137,7 +153,12 @@ class GlobalTokenBucket(TokenBucket):
     When Redis is unavailable -- redis-py not installed, a missing/invalid URL,
     or the server being down -- every Redis interaction degrades to the
     inherited local token-bucket math, so the worker keeps running (limited
-    per-worker) instead of raising.
+    per-worker) instead of raising.  That degradation is also *bounded in
+    latency*: the client is built with a default ``socket_connect_timeout`` and
+    ``socket_timeout`` (:data:`DEFAULT_SOCKET_TIMEOUT`) so an unreachable Redis
+    fails fast rather than stalling the admission hot path on the OS TCP
+    timeout.  Operators can override the bound via the Redis URL query string
+    (for example ``redis://host:6379/0?socket_connect_timeout=5``).
 
     Arguments:
         fill_rate (float): tokens added per second (the parsed ``rate_limit``).
@@ -187,7 +208,17 @@ class GlobalTokenBucket(TokenBucket):
             # to local limiting; any other exception is a real defect and is
             # allowed to propagate.
             try:
-                self._client = redis.from_url(redis_url)
+                # Inject a small default socket timeout so a Redis outage
+                # degrades the admission hot path *quickly* instead of hanging
+                # on the OS TCP connect timeout (~127s) before the can_consume
+                # fallback fires.  Operator-supplied URL query params (for
+                # example ``?socket_connect_timeout=5``) still override these
+                # defaults, so no new user-facing setting is added.
+                self._client = redis.from_url(
+                    redis_url,
+                    socket_connect_timeout=DEFAULT_SOCKET_TIMEOUT,
+                    socket_timeout=DEFAULT_SOCKET_TIMEOUT,
+                )
             except (ValueError, *_REDIS_ERRORS):
                 self._client = None
         else:

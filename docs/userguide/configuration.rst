@@ -3631,6 +3631,14 @@ The Redis connection URL (for example ``redis://localhost:6379/0``,
 consumed via ``redis.from_url``) holding the shared token-bucket state used
 when :setting:`worker_global_rate_limit` is enabled.
 
+The client is built with a small default socket connect/read timeout (2
+seconds) so that if Redis becomes unreachable the limiter falls back to
+local per-worker limiting *quickly*, rather than stalling the task-admission
+path while the operating system's much longer TCP connect timeout elapses.
+You can tune this bound by adding the standard ``redis-py`` socket options to
+the URL query string, which take precedence over the default, for example
+``redis://localhost:6379/0?socket_connect_timeout=5&socket_timeout=5``.
+
 .. setting:: worker_state_db
 
 ``worker_state_db``
