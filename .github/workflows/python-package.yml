@@ -136,7 +136,8 @@ jobs:
           'test_signals.py',
           'test_tasks.py',
           'test_thread_safe.py',
-          'test_worker.py'
+          'test_worker.py',
+          'test_global_ratelimit.py'
         ]
     uses: ./.github/workflows/smoke-tests.yml
     with:
